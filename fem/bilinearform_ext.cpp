@@ -255,7 +255,12 @@ PABilinearFormExtension::PABilinearFormExtension(BilinearForm *form)
 
 void PABilinearFormExtension::SetupRestrictionOperators(const L2FaceValues m)
 {
-   if ( Device::Allows(Backend::CEED_MASK) ) { return; }
+   // dgns-mfem patch: build the native restrictions even when a CEED backend
+   // is allowed. Upstream early-returns here, which silently drops ALL face
+   // integrators from PA forms under Device('ceed-*'). Keeping the native
+   // restrictions lets CEED-capable volume integrators take their libCEED
+   // path while face integrators (no CEED kernels exist) use native PA.
+   // if ( Device::Allows(Backend::CEED_MASK) ) { return; }
    ElementDofOrdering ordering = GetEVectorOrdering(*a->FESpace());
    elem_restrict = trial_fes->GetElementRestriction(ordering);
    if (elem_restrict)
