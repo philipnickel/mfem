@@ -473,6 +473,9 @@ public:
    // Face-neighbor functions
    void ExchangeFaceNbrData();
    int GetFaceNbrVSize() const { return num_face_nbr_dofs; }
+   /** dgns-mfem patch marker: this build contains the multicomponent parallel
+       L2 face-restriction neighbor-layout fix. */
+   bool SupportsVectorL2FaceRestriction() const { return true; }
    void GetFaceNbrElementVDofs(int i, Array<int> &vdofs,
                                DofTransformation &doftrans) const;
    DofTransformation *GetFaceNbrElementVDofs(int i, Array<int> &vdofs) const;
