@@ -247,6 +247,151 @@ void DGTraceIntegrator::AddMultTransposePA(const Vector &x, Vector &y) const
                         y, dofs1D, quad1D);
 }
 
+// PA vector normal-jump integrator. The current dgns-mfem flow solver is 2D;
+// keeping this kernel deliberately narrow avoids pretending that a 3D tensor
+// specialization has been validated when it has not.
+static void PAVectorNormalJumpSetup2D(const int Q1D, const int NF,
+                                      const Array<real_t> &weights,
+                                      const Vector &det,
+                                      const Vector &normal,
+                                      const Vector &coefficient,
+                                      const real_t boundary_factor,
+                                      Vector &op)
+{
+   auto d = Reshape(det.Read(), Q1D, NF);
+   auto n = Reshape(normal.Read(), Q1D, 2, NF);
+   const bool constant = coefficient.Size() == 1;
+   auto c = constant ? Reshape(coefficient.Read(), 1, 1)
+            : Reshape(coefficient.Read(), Q1D, NF);
+   auto w = weights.Read();
+   auto qd = Reshape(op.Write(), Q1D, 2, 2, NF);
+   mfem::forall(Q1D * NF, [=] MFEM_HOST_DEVICE(int index)
+   {
+      const int q = index % Q1D;
+      const int f = index / Q1D;
+      const real_t scale = w[q] * d(q, f) * boundary_factor *
+                           (constant ? c(0, 0) : c(q, f));
+      qd(q, 0, 0, f) = scale * n(q, 0, f) * n(q, 0, f);
+      qd(q, 0, 1, f) = scale * n(q, 0, f) * n(q, 1, f);
+      qd(q, 1, 0, f) = scale * n(q, 1, f) * n(q, 0, f);
+      qd(q, 1, 1, f) = scale * n(q, 1, f) * n(q, 1, f);
+   });
+}
+
+static void PAVectorNormalJumpApply2D(const int D1D, const int Q1D,
+                                      const int NF, const Array<real_t> &b,
+                                      const Array<real_t> &bt,
+                                      const Vector &op_, const Vector &x_,
+                                      Vector &y_)
+{
+   MFEM_VERIFY(D1D <= DeviceDofQuadLimits::Get().MAX_D1D, "");
+   MFEM_VERIFY(Q1D <= DeviceDofQuadLimits::Get().MAX_Q1D, "");
+   auto B = Reshape(b.Read(), Q1D, D1D);
+   auto Bt = Reshape(bt.Read(), D1D, Q1D);
+   auto op = Reshape(op_.Read(), Q1D, 2, 2, NF);
+   auto x = Reshape(x_.Read(), D1D, 2, 2, NF);
+   auto y = Reshape(y_.ReadWrite(), D1D, 2, 2, NF);
+
+   mfem::forall(NF, [=] MFEM_HOST_DEVICE(int f)
+   {
+      real_t side0[DofQuadLimits::MAX_Q1D][2];
+      real_t side1[DofQuadLimits::MAX_Q1D][2];
+      real_t flux[DofQuadLimits::MAX_Q1D][2];
+      for (int q = 0; q < Q1D; ++q)
+      {
+         side0[q][0] = side0[q][1] = 0.0;
+         side1[q][0] = side1[q][1] = 0.0;
+         for (int d = 0; d < D1D; ++d)
+         {
+            const real_t value = B(q, d);
+            side0[q][0] += value * x(d, 0, 0, f);
+            side0[q][1] += value * x(d, 1, 0, f);
+            side1[q][0] += value * x(d, 0, 1, f);
+            side1[q][1] += value * x(d, 1, 1, f);
+         }
+         const real_t jump0 = side0[q][0] - side1[q][0];
+         const real_t jump1 = side0[q][1] - side1[q][1];
+         flux[q][0] = op(q, 0, 0, f) * jump0 + op(q, 0, 1, f) * jump1;
+         flux[q][1] = op(q, 1, 0, f) * jump0 + op(q, 1, 1, f) * jump1;
+      }
+      for (int d = 0; d < D1D; ++d)
+      {
+         real_t load0 = 0.0;
+         real_t load1 = 0.0;
+         for (int q = 0; q < Q1D; ++q)
+         {
+            const real_t value = Bt(d, q);
+            load0 += value * flux[q][0];
+            load1 += value * flux[q][1];
+         }
+         y(d, 0, 0, f) += load0;
+         y(d, 1, 0, f) += load1;
+         y(d, 0, 1, f) -= load0;
+         y(d, 1, 1, f) -= load1;
+      }
+   });
+}
+
+void VectorNormalJumpIntegrator::SetupPA(const FiniteElementSpace &fes,
+                                         FaceType type)
+{
+   Mesh *mesh = fes.GetMesh();
+   dim = mesh->Dimension();
+   MFEM_VERIFY(dim == 2,
+               "VectorNormalJumpIntegrator currently supports 2D meshes");
+   MFEM_VERIFY(fes.GetVDim() == dim,
+               "VectorNormalJumpIntegrator requires vdim == mesh dimension");
+
+   const FiniteElement &trace = *fes.GetTypicalTraceElement();
+   const IntegrationRule *ir = IntRule ? IntRule :
+      &DGTraceIntegrator::GetRule(trace.GetGeomType(), trace.GetOrder(),
+                                  *mesh->GetTypicalElementTransformation());
+   FaceQuadratureSpace qs(*mesh, *ir, type);
+   nf = qs.GetNumFaces();
+   if (nf == 0) { return; }
+   nq = ir->GetNPoints();
+   geom = mesh->GetFaceGeometricFactors(
+             *ir,
+             FaceGeometricFactors::DETERMINANTS | FaceGeometricFactors::NORMALS,
+             type);
+   maps = &trace.GetDofToQuad(*ir, DofToQuad::TENSOR);
+   dofs1D = maps->ndof;
+   quad1D = maps->nqpt;
+   MFEM_VERIFY(nq == quad1D,
+               "2D face rule must contain quad1D integration points");
+
+   CoefficientVector coefficient(*tau, qs, CoefficientStorage::COMPRESSED);
+   pa_data.SetSize(4 * nq * nf, Device::GetMemoryType());
+   const real_t factor = type == FaceType::Boundary ? 2.0 : 1.0;
+   PAVectorNormalJumpSetup2D(quad1D, nf, ir->GetWeights(), geom->detJ,
+                             geom->normal, coefficient, factor, pa_data);
+}
+
+void VectorNormalJumpIntegrator::AssemblePAInteriorFaces(
+   const FiniteElementSpace &fes)
+{
+   SetupPA(fes, FaceType::Interior);
+}
+
+void VectorNormalJumpIntegrator::AssemblePABoundaryFaces(
+   const FiniteElementSpace &fes)
+{
+   SetupPA(fes, FaceType::Boundary);
+}
+
+void VectorNormalJumpIntegrator::AddMultPA(const Vector &x, Vector &y) const
+{
+   if (nf == 0) { return; }
+   PAVectorNormalJumpApply2D(dofs1D, quad1D, nf, maps->B, maps->Bt,
+                             pa_data, x, y);
+}
+
+void VectorNormalJumpIntegrator::AddMultTransposePA(const Vector &x,
+                                                     Vector &y) const
+{
+   AddMultPA(x, y);
+}
+
 DGTraceIntegrator::DGTraceIntegrator(real_t a, real_t b) : alpha(a), beta(b)
 {
    static Kernels kernels;

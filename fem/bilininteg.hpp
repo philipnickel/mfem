@@ -3464,6 +3464,37 @@ private:
 // Alias for @a DGTraceIntegrator.
 using ConservativeDGTraceIntegrator = DGTraceIntegrator;
 
+/** Partially assembled vector normal-jump penalty
+    \f$\langle \tau [u]\cdot n,[v]\cdot n\rangle\f$ on L2 faces.
+
+    The finite element space must have vector dimension equal to the mesh
+    dimension.  On boundary faces the exterior state is the homogeneous
+    mirror state, so the action is
+    \f$2\langle \tau u\cdot n,v\cdot n\rangle\f$.  The coefficient is defined
+    on the selected face quadrature space; callers that derive it from
+    element data are responsible for supplying the desired two-sided average
+    on interior faces. */
+class VectorNormalJumpIntegrator : public BilinearFormIntegrator
+{
+protected:
+   Coefficient *tau;
+   Vector pa_data;
+   const DofToQuad *maps = nullptr;            ///< Not owned
+   const FaceGeometricFactors *geom = nullptr; ///< Not owned
+   int dim = 0, nf = 0, nq = 0, dofs1D = 0, quad1D = 0;
+
+public:
+   explicit VectorNormalJumpIntegrator(Coefficient &q) : tau(&q) { }
+
+   void AssemblePAInteriorFaces(const FiniteElementSpace &fes) override;
+   void AssemblePABoundaryFaces(const FiniteElementSpace &fes) override;
+   void AddMultPA(const Vector &x, Vector &y) const override;
+   void AddMultTransposePA(const Vector &x, Vector &y) const override;
+
+private:
+   void SetupPA(const FiniteElementSpace &fes, FaceType type);
+};
+
 /** Integrator that represents the face terms used for the non-conservative
     DG discretization of the convection equation:
     $$
