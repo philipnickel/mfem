@@ -15,6 +15,155 @@
 namespace mfem
 {
 
+ALEConvectionBoundaryIntegrator::ALEConvectionBoundaryIntegrator(
+   int order, real_t upwind_factor, const Vector &beta_weights,
+   const Vector &delta_weights, bool convection, bool pressure_delta,
+   bool continuity_enabled)
+   : history_order(order),
+     vdim(2 * order + (continuity_enabled ? 4 : 2)),
+     upwind(upwind_factor),
+     beta(&beta_weights),
+     delta(&delta_weights),
+     include_convection(convection),
+     include_pressure_delta(pressure_delta)
+{
+   MFEM_VERIFY(history_order > 0 && history_order <= 3,
+               "native ALE boundary integrator supports BDF/EX order one to three");
+   MFEM_VERIFY(upwind >= 0.0, "ALE upwind factor must be non-negative");
+   MFEM_VERIFY(beta->Size() == history_order,
+               "ALE beta vector must match the history order");
+   MFEM_VERIFY(delta->Size() == history_order,
+               "ALE delta vector must match the history order");
+   MFEM_VERIFY(include_convection || include_pressure_delta,
+               "ALE boundary integrator has no enabled output");
+}
+
+void ALEConvectionBoundaryIntegrator::AssembleFaceVector(
+   const FiniteElement &el1, const FiniteElement &,
+   FaceElementTransformations &Tr, const Vector &elfun, Vector &elvect)
+{
+   MFEM_VERIFY(Tr.Elem2No < 0,
+               "ALEConvectionBoundaryIntegrator requires a boundary face");
+   MFEM_VERIFY(Tr.GetSpaceDim() == 2,
+               "ALEConvectionBoundaryIntegrator currently supports 2D meshes");
+   MFEM_VERIFY(!include_convection || datum,
+               "Dirichlet ALE convection requires a boundary datum");
+   MFEM_VERIFY(!datum || datum->GetVDim() == 2,
+               "ALE boundary datum must have two components");
+   MFEM_VERIFY(beta->Size() == history_order && delta->Size() == history_order,
+               "ALE history weights changed size after construction");
+
+   const int dof = el1.GetDof();
+   MFEM_VERIFY(elfun.Size() == vdim * dof,
+               "packed ALE boundary state has the wrong size");
+   elvect.SetSize(vdim * dof);
+   elvect = 0.0;
+   shape.SetSize(dof);
+   normal.SetSize(2);
+   if (include_pressure_delta) { dshape.SetSize(dof, 2); }
+
+   const IntegrationRule *ir = IntRule;
+   if (!ir)
+   {
+      ir = &IntRules.Get(Tr.GetGeometryType(), 2 * el1.GetOrder() + 2);
+   }
+
+   for (int point = 0; point < ir->GetNPoints(); point++)
+   {
+      const IntegrationPoint &face_ip = ir->IntPoint(point);
+      Tr.SetAllIntPoints(&face_ip);
+      const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
+      el1.CalcShape(ip1, shape);
+      CalcOrtho(Tr.Jacobian(), normal);
+
+      real_t velocity[3][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+      real_t grid[2] = {0.0, 0.0};
+      for (int history = 0; history < history_order; history++)
+      {
+         for (int component = 0; component < 2; component++)
+         {
+            const int offset = (2 * history + component) * dof;
+            for (int j = 0; j < dof; j++)
+            {
+               velocity[history][component] += elfun(offset + j) * shape(j);
+            }
+         }
+      }
+      for (int component = 0; component < 2; component++)
+      {
+         const int offset = (2 * history_order + component) * dof;
+         for (int j = 0; j < dof; j++)
+         {
+            grid[component] += elfun(offset + j) * shape(j);
+         }
+      }
+
+      const real_t weight = face_ip.weight;
+      if (include_convection)
+      {
+         datum->Eval(datum_value, *Tr.Elem1, ip1);
+         const real_t normal_speed =
+            (datum_value(0) - grid[0]) * normal(0) +
+            (datum_value(1) - grid[1]) * normal(1);
+         const real_t coefficient =
+            upwind * std::abs(normal_speed) - normal_speed;
+         for (int component = 0; component < 2; component++)
+         {
+            real_t correction = 0.0;
+            for (int history = 0; history < history_order; history++)
+            {
+               correction += (*beta)(history) *
+                             (velocity[history][component] - datum_value(component));
+            }
+            correction *= coefficient * weight;
+            const int offset = component * dof;
+            for (int j = 0; j < dof; j++)
+            {
+               elvect(offset + j) += correction * shape(j);
+            }
+         }
+      }
+
+      if (include_pressure_delta)
+      {
+         Tr.Elem1->SetIntPoint(&ip1);
+         el1.CalcPhysDShape(*Tr.Elem1, dshape);
+         real_t pressure_load = 0.0;
+         for (int history = 0; history < history_order; history++)
+         {
+            real_t acceleration[2] = {0.0, 0.0};
+            const real_t relative[2] =
+            {
+               velocity[history][0] - grid[0],
+               velocity[history][1] - grid[1]
+            };
+            for (int component = 0; component < 2; component++)
+            {
+               for (int direction = 0; direction < 2; direction++)
+               {
+                  real_t gradient = 0.0;
+                  const int offset = (2 * history + component) * dof;
+                  for (int j = 0; j < dof; j++)
+                  {
+                     gradient += elfun(offset + j) * dshape(j, direction);
+                  }
+                  acceleration[component] += gradient * relative[direction];
+               }
+            }
+            pressure_load += (*delta)(history) *
+                             (acceleration[0] * normal(0) +
+                              acceleration[1] * normal(1));
+         }
+         pressure_load *= weight;
+         const int offset = 2 * dof;
+         for (int j = 0; j < dof; j++)
+         {
+            elvect(offset + j) += pressure_load * shape(j);
+         }
+      }
+   }
+}
+
 real_t NonlinearFormIntegrator::GetLocalStateEnergyPA(const Vector &x) const
 {
    mfem_error ("NonlinearFormIntegrator::GetLocalStateEnergyPA(...)\n"

@@ -157,6 +157,60 @@ public:
    }
 };
 
+/** @brief Native boundary-face integrator for a packed explicit ALE history.
+
+    The input finite-element space uses byNODES ordering with components
+
+    ``(u_0x,u_0y,...,u_(J-1)x,u_(J-1)y,w_x,w_y[,scratch_x,scratch_y])``.
+
+    On a velocity-Dirichlet boundary this integrator applies the mirror-state
+    correction
+
+    ``(upwind*|a.n|-a.n) sum_i beta_i (u_i-g)``
+
+    where ``a=g-w``.  It can simultaneously place the reduced strong pressure
+    boundary load
+
+    ``sum_i delta_i ((grad u_i)(u_i-w)).n``
+
+    in packed output component two.  The last two optional components are
+    reserved by the caller for the continuity-penalty action and do not affect
+    this integrator.
+
+    The coefficient and weight vectors are not owned and must remain valid for
+    the lifetime of the integrator. */
+class ALEConvectionBoundaryIntegrator : public NonlinearFormIntegrator
+{
+private:
+   int history_order;
+   int vdim;
+   real_t upwind;
+   const Vector *beta;
+   const Vector *delta;
+   VectorCoefficient *datum = nullptr;
+   bool include_convection;
+   bool include_pressure_delta;
+
+   Vector shape, normal, datum_value;
+   DenseMatrix dshape;
+
+public:
+   ALEConvectionBoundaryIntegrator(int order, real_t upwind_factor,
+                                   const Vector &beta_weights,
+                                   const Vector &delta_weights,
+                                   bool convection, bool pressure_delta,
+                                   bool continuity_enabled = false);
+
+   /// Set the current vector-valued Dirichlet datum (not owned).
+   void SetDatum(VectorCoefficient &coefficient) { datum = &coefficient; }
+
+   void AssembleFaceVector(const FiniteElement &el1,
+                           const FiniteElement &el2,
+                           FaceElementTransformations &Tr,
+                           const Vector &elfun,
+                           Vector &elvect) override;
+};
+
 /** The abstract base class BlockNonlinearFormIntegrator is
     a generalization of the NonlinearFormIntegrator class suitable
     for block state vectors. */
