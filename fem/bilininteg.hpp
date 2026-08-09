@@ -3507,6 +3507,14 @@ protected:
    MatrixCoefficient *MQ = nullptr;
    real_t sigma, kappa;
 
+   // dgns-mfem patch: optional penalty weight coefficient. When set, it
+   // replaces the built-in geometric {q/h} estimate in the jump term, both
+   // in the legacy kernel (wq) and in the PA setup data (pa(1) in 2D, pa(6)
+   // in 3D), so the applied penalty is kappa * KQ(x_face) * [u][v]. This
+   // allows spatially varying SIP penalties (e.g. a per-face max of
+   // element-based coefficients) that the scalar kappa cannot express.
+   Coefficient *KQ = nullptr;
+
    // these are not thread-safe!
    Vector shape1, shape2, dshape1dn, dshape2dn, nor, nh, ni;
    DenseMatrix jmat, dshape1, dshape2, mq, adjJ;
@@ -3543,6 +3551,10 @@ public:
    const IntegrationRule &GetRule(int order, Geometry::Type geom);
 
    real_t GetPenaltyParameter() const { return kappa; }
+
+   /// dgns-mfem patch: set a penalty weight coefficient replacing the
+   /// built-in {1/h} estimate in the jump term (see the KQ member above).
+   void SetPenaltyCoefficient(Coefficient &kq) { KQ = &kq; }
 
    /// arguments: nf, B, Bt, G, Gt, sigma, pa_data, x, dxdn, y, dydn, dofs1D,
    /// quad1D

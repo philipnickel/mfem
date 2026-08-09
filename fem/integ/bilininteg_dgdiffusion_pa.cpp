@@ -26,6 +26,7 @@ static void PADGDiffusionSetup2D(const int Q1D, const int NE, const int NF,
                                  const FaceGeometricFactors &face_geom,
                                  const FaceNeighborGeometricFactors *nbr_geom,
                                  const Vector &q, const int coeff_dim,
+                                 const Vector &kq, const bool use_kq,
                                  const real_t sigma, const real_t kappa,
                                  Vector &pa_data, const Array<int> &face_info_)
 {
@@ -44,6 +45,16 @@ static void PADGDiffusionSetup2D(const int Q1D, const int NE, const int NF,
    const bool const_q = (q.Size() == coeff_dim);
    const auto Q = const_q ? Reshape(q.Read(), coeff_dim, 1, 1)
                   : Reshape(q.Read(), coeff_dim, Q1D, NF);
+
+   // dgns-mfem patch: optional penalty weight, same face-quadrature layout.
+   const bool const_kq = (kq.Size() == 1);
+   const auto KQv = const_kq ? Reshape(kq.Read(), 1, 1, 1)
+                    : Reshape(kq.Read(), 1, Q1D, NF);
+   auto get_kq = [const_kq] MFEM_HOST_DEVICE (const decltype(KQv) &K, int qx,
+                                              int f)
+   {
+      return const_kq ? K(0,0,0) : K(0,qx,f);
+   };
 
    const auto W = w.Read();
 
@@ -136,7 +147,7 @@ static void PADGDiffusionSetup2D(const int Q1D, const int NE, const int NF,
             pa(5, p, f) = 0.0;
          }
 
-         pa(1, p, f) = hi;
+         pa(1, p, f) = use_kq ? get_kq(KQv, p, f) : hi;
       }
    });
 }
@@ -147,6 +158,7 @@ static void PADGDiffusionSetup3D(const int Q1D, const int NE, const int NF,
                                  const FaceGeometricFactors &face_geom,
                                  const FaceNeighborGeometricFactors *nbr_geom,
                                  const Vector &q, const int coeff_dim,
+                                 const Vector &kq, const bool use_kq,
                                  const real_t sigma, const real_t kappa,
                                  Vector &pa_data, const Array<int> &face_info_)
 {
@@ -165,6 +177,16 @@ static void PADGDiffusionSetup3D(const int Q1D, const int NE, const int NF,
    const bool const_q = (q.Size() == coeff_dim);
    const auto Q = const_q ? Reshape(q.Read(), coeff_dim, 1, 1, 1)
                   : Reshape(q.Read(), coeff_dim, Q1D, Q1D, NF);
+
+   // dgns-mfem patch: optional penalty weight, same face-quadrature layout.
+   const bool const_kq = (kq.Size() == 1);
+   const auto KQv = const_kq ? Reshape(kq.Read(), 1, 1, 1, 1)
+                    : Reshape(kq.Read(), 1, Q1D, Q1D, NF);
+   auto get_kq = [const_kq] MFEM_HOST_DEVICE (const decltype(KQv) &K, int qx,
+                                              int qy, int f)
+   {
+      return const_kq ? K(0,0,0,0) : K(0,qx,qy,f);
+   };
 
    const auto W = Reshape(w.Read(), Q1D, Q1D);
 
@@ -298,7 +320,8 @@ static void PADGDiffusionSetup3D(const int Q1D, const int NE, const int NF,
                pa(5, p1, p2, f) = 0.0;
             }
 
-            pa(6, p1, p2, f) = kappa * hi * qh * W(p1, p2) * dJf;
+            pa(6, p1, p2, f) = kappa * (use_kq ? get_kq(KQv, p1, p2, f) : hi) *
+                               qh * W(p1, p2) * dJf;
          }
       }
    });
@@ -545,6 +568,13 @@ void DGDiffusionIntegrator::SetupPA(const FiniteElementSpace &fes,
    else if (MQ) { q.Project(*MQ); }
    else { q.SetConstant(1.0); }
 
+   // dgns-mfem patch: project the optional penalty weight coefficient onto
+   // the same face quadrature space; it replaces the geometric {1/h} factor.
+   CoefficientVector kq(fqs, CoefficientStorage::CONSTANTS);
+   const bool use_kq = (KQ != nullptr);
+   if (use_kq) { kq.Project(*KQ); }
+   else { kq.SetConstant(1.0); }
+
    const int coeff_dim = q.GetVDim();
 
    Array<int> face_info;
@@ -556,15 +586,15 @@ void DGDiffusionIntegrator::SetupPA(const FiniteElementSpace &fes,
    {
       PADGDiffusionSetupFaceInfo2D(nf, mesh, type, face_info);
       PADGDiffusionSetup2D(quad1D, ne, nf, ir.GetWeights(), *el_geom,
-                           *face_geom, nbr_geom.get(), q, coeff_dim, sigma,
-                           kappa, pa_data, face_info);
+                           *face_geom, nbr_geom.get(), q, coeff_dim, kq, use_kq,
+                           sigma, kappa, pa_data, face_info);
    }
    else if (dim == 3)
    {
       PADGDiffusionSetupFaceInfo3D(nf, mesh, type, face_info);
       PADGDiffusionSetup3D(quad1D, ne, nf, ir.GetWeights(), *el_geom,
-                           *face_geom, nbr_geom.get(), q, coeff_dim, sigma,
-                           kappa, pa_data, face_info);
+                           *face_geom, nbr_geom.get(), q, coeff_dim, kq, use_kq,
+                           sigma, kappa, pa_data, face_info);
    }
 }
 

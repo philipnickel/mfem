@@ -3849,7 +3849,16 @@ void DGDiffusionIntegrator::AssembleFaceMatrix(
       adjJ.Mult(ni, nh);
       if (kappa_is_nonzero)
       {
-         wq = ni * nor;
+         // dgns-mfem patch: an explicit penalty weight replaces the {1/h}
+         // estimate; the face measure comes from the face transformation.
+         if (KQ)
+         {
+            wq = ip.weight * Trans.Face->Weight() * KQ->Eval(*Trans.Face, ip);
+         }
+         else
+         {
+            wq = ni * nor;
+         }
       }
       // Note: in the jump term, we use 1/h1 = |nor|/det(J1) which is
       // independent of Loc1 and always gives the size of element 1 in
@@ -3890,7 +3899,7 @@ void DGDiffusionIntegrator::AssembleFaceMatrix(
          }
          CalcAdjugate(Trans.Elem2->Jacobian(), adjJ);
          adjJ.Mult(ni, nh);
-         if (kappa_is_nonzero)
+         if (kappa_is_nonzero && !KQ)
          {
             wq += ni * nor;
          }
