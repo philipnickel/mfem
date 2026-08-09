@@ -465,3 +465,42 @@ TEST_CASE("QuadratureInterpolator", "[QuadratureInterpolator][GPU]")
       }
    }
 }
+
+TEST_CASE("High-order FaceQuadratureInterpolator",
+          "[FaceQuadratureInterpolator][CPU]")
+{
+   constexpr int order = 10;
+   constexpr int qpts = 16;
+
+   REQUIRE(FaceQuadratureInterpolator::GetMaxND1D() >= order + 1);
+   REQUIRE(FaceQuadratureInterpolator::GetMaxNQ1D() >= qpts);
+   REQUIRE(FaceQuadratureInterpolator::SupportsTensorFaceSize(order + 1,
+                                                               qpts));
+
+   Mesh mesh = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL, true);
+   H1_FECollection fec(order, 2);
+   FiniteElementSpace fes(&mesh, &fec);
+   GridFunction x(&fes);
+   x = 2.0;
+
+   const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 2*qpts - 1);
+   REQUIRE(ir.GetNPoints() == qpts);
+
+   const FaceRestriction *restriction = fes.GetFaceRestriction(
+      ElementDofOrdering::LEXICOGRAPHIC, FaceType::Boundary,
+      L2FaceValues::SingleValued);
+   REQUIRE(restriction != nullptr);
+
+   Vector face_e(restriction->Height());
+   restriction->Mult(x, face_e);
+
+   const FaceQuadratureInterpolator *interpolator =
+      fes.GetFaceQuadratureInterpolator(ir, FaceType::Boundary);
+   REQUIRE(interpolator != nullptr);
+   interpolator->SetOutputLayout(QVectorLayout::byNODES);
+
+   Vector values(qpts * fes.GetNFbyType(FaceType::Boundary));
+   interpolator->Values(face_e, values);
+   values -= 2.0;
+   REQUIRE(values.Normlinf() == MFEM_Approx(0.0));
+}

@@ -603,6 +603,53 @@ TEST_CASE("PA Convection", "[PartialAssembly], [GPU]")
    }
 } // test case
 
+TEST_CASE("PA DG trace with degree-10 overintegration",
+          "[PartialAssembly][DGTrace][CPU]")
+{
+   constexpr int order = 10;
+   constexpr int qpts = 16;
+
+   Mesh mesh("../../data/periodic-square.mesh", 1, 1);
+   L2_FECollection fec(order, 2, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&mesh, &fec);
+
+   Vector velocity_value({1.0, -0.25});
+   VectorConstantCoefficient velocity(velocity_value);
+   ConstantCoefficient rho(1.0);
+   const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 2*qpts - 1);
+   REQUIRE(ir.GetNPoints() == qpts);
+
+   BilinearForm full(&fes);
+   BilinearForm partial(&fes);
+   auto add_face_integrator = [&](BilinearForm &form)
+   {
+      auto *trace = new TransposeIntegrator(
+         new DGTraceIntegrator(rho, velocity, 1.0, -0.5));
+      trace->SetIntegrationRule(ir);
+      form.AddInteriorFaceIntegrator(trace);
+   };
+   add_face_integrator(full);
+   add_face_integrator(partial);
+
+   full.Assemble();
+   full.Finalize();
+   partial.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   partial.Assemble();
+
+   GridFunction x(&fes), y_full(&fes), y_partial(&fes);
+   x.Randomize(1);
+
+   full.Mult(x, y_full);
+   partial.Mult(x, y_partial);
+   y_partial -= y_full;
+   REQUIRE(y_partial.Norml2() <= 1e-11);
+
+   full.MultTranspose(x, y_full);
+   partial.MultTranspose(x, y_partial);
+   y_partial -= y_full;
+   REQUIRE(y_partial.Norml2() <= 1e-11);
+}
+
 // Advanced unit tests for convection
 TEST_CASE("PA Convection advanced", "[PartialAssembly], [MFEMData], [GPU]")
 {

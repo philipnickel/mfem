@@ -109,8 +109,10 @@ void FaceQuadratureInterpolator::Eval2D(
    const int ND1D = T_ND1D ? T_ND1D : nd1d;
    const int NQ1D = T_NQ1D ? T_NQ1D : nq1d;
    const int VDIM = T_VDIM ? T_VDIM : vdim;
-   MFEM_VERIFY(ND1D <= MAX_ND1D, "");
-   MFEM_VERIFY(NQ1D <= MAX_NQ1D, "");
+   MFEM_VERIFY(ND1D <= MAX_ND1D,
+               "FaceQuadratureInterpolator basis size exceeds GetMaxND1D()");
+   MFEM_VERIFY(NQ1D <= MAX_NQ1D,
+               "FaceQuadratureInterpolator rule exceeds GetMaxNQ1D()");
    MFEM_VERIFY(VDIM == 2 || !(eval_flags & DETERMINANTS), "");
    auto B = Reshape(maps.B.Read(), NQ1D, ND1D);
    auto G = Reshape(maps.G.Read(), NQ1D, ND1D);
@@ -236,8 +238,10 @@ void FaceQuadratureInterpolator::Eval3D(
    const int ND1D = T_ND1D ? T_ND1D : nd1d;
    const int NQ1D = T_NQ1D ? T_NQ1D : nq1d;
    const int VDIM = T_VDIM ? T_VDIM : vdim;
-   MFEM_VERIFY(ND1D <= MAX_ND1D, "");
-   MFEM_VERIFY(NQ1D <= MAX_NQ1D, "");
+   MFEM_VERIFY(ND1D <= MAX_ND1D,
+               "FaceQuadratureInterpolator basis size exceeds GetMaxND1D()");
+   MFEM_VERIFY(NQ1D <= MAX_NQ1D,
+               "FaceQuadratureInterpolator rule exceeds GetMaxNQ1D()");
    MFEM_VERIFY(VDIM == 3 || !(eval_flags & DETERMINANTS), "");
    auto B = Reshape(maps.B.Read(), NQ1D, ND1D);
    auto G = Reshape(maps.G.Read(), NQ1D, ND1D);
@@ -443,8 +447,10 @@ void FaceQuadratureInterpolator::SmemEval3D(
    const int ND1D = T_ND1D ? T_ND1D : nd1d;
    const int NQ1D = T_NQ1D ? T_NQ1D : nq1d;
    const int VDIM = T_VDIM ? T_VDIM : vdim;
-   MFEM_VERIFY(ND1D <= MAX_ND1D, "");
-   MFEM_VERIFY(NQ1D <= MAX_NQ1D, "");
+   MFEM_VERIFY(ND1D <= MAX_ND1D,
+               "FaceQuadratureInterpolator basis size exceeds GetMaxND1D()");
+   MFEM_VERIFY(NQ1D <= MAX_NQ1D,
+               "FaceQuadratureInterpolator rule exceeds GetMaxNQ1D()");
    MFEM_VERIFY(VDIM == 3 || !(eval_flags & DETERMINANTS), "");
    auto B = Reshape(maps.B.Read(), NQ1D, ND1D);
    auto G = Reshape(maps.G.Read(), NQ1D, ND1D);

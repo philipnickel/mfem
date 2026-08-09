@@ -37,8 +37,16 @@ protected:
 
    mutable bool use_tensor_products;
 
+   // Keep the existing accelerator limits until the larger kernels have been
+   // validated for their register and shared-memory use.  CPU kernels can use
+   // the wider generic buffers needed by overintegrated high-order DG faces.
+#if defined(MFEM_USE_CUDA) || defined(MFEM_USE_HIP)
    static const int MAX_NQ1D = 10;
    static const int MAX_ND1D = 10;
+#else
+   static const int MAX_NQ1D = 16;
+   static const int MAX_ND1D = 16;
+#endif
    static const int MAX_VDIM1D = 1;
 
    static const int MAX_NQ2D = 100;
@@ -50,6 +58,16 @@ protected:
    static const int MAX_VDIM3D = 3;
 
 public:
+   /// Maximum number of tensor-product quadrature points per face dimension.
+   static int GetMaxNQ1D() { return MAX_NQ1D; }
+
+   /// Maximum number of tensor-product basis degrees of freedom per dimension.
+   static int GetMaxND1D() { return MAX_ND1D; }
+
+   /// Return whether the generic tensor-product face kernels support this size.
+   static bool SupportsTensorFaceSize(int nd1d, int nq1d)
+   { return nd1d <= MAX_ND1D && nq1d <= MAX_NQ1D; }
+
    enum FaceEvalFlags
    {
       VALUES       = 1 << 0,  ///< Evaluate the values at quadrature points
