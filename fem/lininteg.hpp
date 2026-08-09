@@ -575,6 +575,7 @@ class DGDirichletLFIntegrator : public LinearFormIntegrator
 protected:
    Coefficient *uD, *Q;
    MatrixCoefficient *MQ;
+   Coefficient *KQ;
    real_t sigma, kappa;
 
    // these are not thread-safe!
@@ -583,13 +584,17 @@ protected:
 
 public:
    DGDirichletLFIntegrator(Coefficient &u, const real_t s, const real_t k)
-      : uD(&u), Q(NULL), MQ(NULL), sigma(s), kappa(k) { }
+      : uD(&u), Q(NULL), MQ(NULL), KQ(NULL), sigma(s), kappa(k) { }
    DGDirichletLFIntegrator(Coefficient &u, Coefficient &q,
                            const real_t s, const real_t k)
-      : uD(&u), Q(&q), MQ(NULL), sigma(s), kappa(k) { }
+      : uD(&u), Q(&q), MQ(NULL), KQ(NULL), sigma(s), kappa(k) { }
    DGDirichletLFIntegrator(Coefficient &u, MatrixCoefficient &q,
                            const real_t s, const real_t k)
-      : uD(&u), Q(NULL), MQ(&q), sigma(s), kappa(k) { }
+      : uD(&u), Q(NULL), MQ(&q), KQ(NULL), sigma(s), kappa(k) { }
+
+   /// Set an explicit face penalty coefficient. When present, the penalty
+   /// term is kappa KQ u_D v instead of MFEM's built-in {Q/h} estimate.
+   void SetPenaltyCoefficient(Coefficient &kq) { KQ = &kq; }
 
    void AssembleRHSElementVect(const FiniteElement &el,
                                ElementTransformation &Tr,

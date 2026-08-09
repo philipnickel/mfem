@@ -913,7 +913,32 @@ void DGDirichletLFIntegrator::AssembleRHSElementVect(
 
       if (kappa_is_nonzero)
       {
-         elvect.Add(kappa*(ni*nor), shape);
+         if (KQ)
+         {
+            // Explicit SIP weight: KQ carries the geometry-dependent tau;
+            // retain the scalar diffusion coefficient, when present, so the
+            // RHS remains the exact Nitsche pair of Q * SIP on the LHS.
+            real_t penalty_weight = ip.weight * uD->Eval(Tr, ip) *
+                                    Tr.Face->Weight() * KQ->Eval(Tr, ip);
+            if (Q)
+            {
+               penalty_weight *= Q->Eval(*Tr.Elem1, eip);
+            }
+            else if (MQ)
+            {
+               // For anisotropic diffusion use n^T Q n with a unit normal.
+               // This branch preserves the scalar-Q result and avoids
+               // folding geometry back into an already geometric KQ.
+               MQ->Eval(mq, *Tr.Elem1, eip);
+               mq.Mult(nor, nh);
+               penalty_weight *= (nor * nh) / (nor * nor);
+            }
+            elvect.Add(kappa*penalty_weight, shape);
+         }
+         else
+         {
+            elvect.Add(kappa*(ni*nor), shape);
+         }
       }
    }
 }
