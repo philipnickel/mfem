@@ -211,6 +211,51 @@ public:
                            Vector &elvect) override;
 };
 
+/** @brief Native interior-face integrator for a packed explicit ALE history.
+
+    The input finite-element space uses byNODES ordering with components
+
+    ``(u_0x,u_0y,...,u_(J-1)x,u_(J-1)y,w_x,w_y)``.
+
+    On each interior face, the integrator evaluates the two velocity traces
+    and the two grid-velocity traces.  For history @a i, let
+
+    ``a_i.n = (average(u_i)-average(w)).n`` and ``jump_i = u_i^- - u_i^+``.
+
+    It adds the local Lax--Friedrichs strong-face corrections
+
+    ``sum_i beta_i 0.5*(-a_i.n + upwind*|a_i.n|)*jump_i``
+
+    on element one and
+
+    ``sum_i beta_i 0.5*(-a_i.n - upwind*|a_i.n|)*jump_i``
+
+    on element two.  The normal returned by CalcOrtho includes the physical
+    face Jacobian, so the corrections above include the surface measure.
+
+    The weight vector is not owned and must remain valid for the lifetime of
+    the integrator. */
+class ALEConvectionInteriorIntegrator : public NonlinearFormIntegrator
+{
+private:
+   int history_order;
+   int vdim;
+   real_t upwind;
+   const Vector *beta;
+
+   Vector shape1, shape2, normal;
+
+public:
+   ALEConvectionInteriorIntegrator(int order, real_t upwind_factor,
+                                   const Vector &beta_weights);
+
+   void AssembleFaceVector(const FiniteElement &el1,
+                           const FiniteElement &el2,
+                           FaceElementTransformations &Tr,
+                           const Vector &elfun,
+                           Vector &elvect) override;
+};
+
 /** The abstract base class BlockNonlinearFormIntegrator is
     a generalization of the NonlinearFormIntegrator class suitable
     for block state vectors. */

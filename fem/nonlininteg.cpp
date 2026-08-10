@@ -15,6 +15,135 @@
 namespace mfem
 {
 
+ALEConvectionInteriorIntegrator::ALEConvectionInteriorIntegrator(
+   int order, real_t upwind_factor, const Vector &beta_weights)
+   : history_order(order),
+     vdim(2 * order + 2),
+     upwind(upwind_factor),
+     beta(&beta_weights)
+{
+   MFEM_VERIFY(history_order > 0 && history_order <= 3,
+               "native ALE interior integrator supports BDF/EX order one to three");
+   MFEM_VERIFY(upwind >= 0.0, "ALE upwind factor must be non-negative");
+   MFEM_VERIFY(beta->Size() == history_order,
+               "ALE beta vector must match the history order");
+}
+
+void ALEConvectionInteriorIntegrator::AssembleFaceVector(
+   const FiniteElement &el1, const FiniteElement &el2,
+   FaceElementTransformations &Tr, const Vector &elfun, Vector &elvect)
+{
+   MFEM_VERIFY(Tr.Elem2No >= 0,
+               "ALEConvectionInteriorIntegrator requires an interior face");
+   MFEM_VERIFY(Tr.GetSpaceDim() == 2,
+               "ALEConvectionInteriorIntegrator currently supports 2D meshes");
+   MFEM_VERIFY(beta->Size() == history_order,
+               "ALE history weights changed size after construction");
+
+   const int dof1 = el1.GetDof();
+   const int dof2 = el2.GetDof();
+   const int offset2 = vdim * dof1;
+   MFEM_VERIFY(elfun.Size() == vdim * (dof1 + dof2),
+               "packed ALE interior state has the wrong size");
+   elvect.SetSize(elfun.Size());
+   elvect = 0.0;
+   shape1.SetSize(dof1);
+   shape2.SetSize(dof2);
+   normal.SetSize(2);
+
+   const IntegrationRule *ir = IntRule;
+   if (!ir)
+   {
+      ir = &IntRules.Get(Tr.GetGeometryType(),
+                         2 * std::max(el1.GetOrder(), el2.GetOrder()) + 2);
+   }
+
+   for (int point = 0; point < ir->GetNPoints(); point++)
+   {
+      const IntegrationPoint &face_ip = ir->IntPoint(point);
+      Tr.SetAllIntPoints(&face_ip);
+      const IntegrationPoint &ip1 = Tr.GetElement1IntPoint();
+      const IntegrationPoint &ip2 = Tr.GetElement2IntPoint();
+      el1.CalcShape(ip1, shape1);
+      el2.CalcShape(ip2, shape2);
+      CalcOrtho(Tr.Jacobian(), normal);
+
+      real_t velocity1[3][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+      real_t velocity2[3][2] = {{0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+      real_t grid1[2] = {0.0, 0.0};
+      real_t grid2[2] = {0.0, 0.0};
+      for (int history = 0; history < history_order; history++)
+      {
+         for (int component = 0; component < 2; component++)
+         {
+            const int component_offset1 = (2 * history + component) * dof1;
+            const int component_offset2 = offset2 + (2 * history + component) * dof2;
+            for (int j = 0; j < dof1; j++)
+            {
+               velocity1[history][component] +=
+                  elfun(component_offset1 + j) * shape1(j);
+            }
+            for (int j = 0; j < dof2; j++)
+            {
+               velocity2[history][component] +=
+                  elfun(component_offset2 + j) * shape2(j);
+            }
+         }
+      }
+      for (int component = 0; component < 2; component++)
+      {
+         const int component_offset1 = (2 * history_order + component) * dof1;
+         const int component_offset2 = offset2 + (2 * history_order + component) * dof2;
+         for (int j = 0; j < dof1; j++)
+         {
+            grid1[component] += elfun(component_offset1 + j) * shape1(j);
+         }
+         for (int j = 0; j < dof2; j++)
+         {
+            grid2[component] += elfun(component_offset2 + j) * shape2(j);
+         }
+      }
+
+      real_t flux1[2] = {0.0, 0.0};
+      real_t flux2[2] = {0.0, 0.0};
+      for (int history = 0; history < history_order; history++)
+      {
+         const real_t normal_speed =
+            (0.5 * (velocity1[history][0] + velocity2[history][0]
+                    - grid1[0] - grid2[0])) * normal(0) +
+            (0.5 * (velocity1[history][1] + velocity2[history][1]
+                    - grid1[1] - grid2[1])) * normal(1);
+         const real_t dissipation = upwind * std::abs(normal_speed);
+         const real_t coefficient1 = 0.5 * (-normal_speed + dissipation);
+         const real_t coefficient2 = 0.5 * (-normal_speed - dissipation);
+         for (int component = 0; component < 2; component++)
+         {
+            const real_t jump =
+               velocity1[history][component] - velocity2[history][component];
+            flux1[component] += (*beta)(history) * coefficient1 * jump;
+            flux2[component] += (*beta)(history) * coefficient2 * jump;
+         }
+      }
+
+      const real_t weight = face_ip.weight;
+      for (int component = 0; component < 2; component++)
+      {
+         const int component_offset1 = component * dof1;
+         const int component_offset2 = offset2 + component * dof2;
+         for (int j = 0; j < dof1; j++)
+         {
+            elvect(component_offset1 + j) +=
+               weight * flux1[component] * shape1(j);
+         }
+         for (int j = 0; j < dof2; j++)
+         {
+            elvect(component_offset2 + j) +=
+               weight * flux2[component] * shape2(j);
+         }
+      }
+   }
+}
+
 ALEConvectionBoundaryIntegrator::ALEConvectionBoundaryIntegrator(
    int order, real_t upwind_factor, const Vector &beta_weights,
    const Vector &delta_weights, bool convection, bool pressure_delta,

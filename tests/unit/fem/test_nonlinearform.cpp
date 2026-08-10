@@ -14,6 +14,70 @@
 
 using namespace mfem;
 
+namespace
+{
+
+void SetALEElementComponent(FiniteElementSpace &fes, Vector &state,
+                            int element, int component, real_t value)
+{
+   Array<int> vdofs;
+   fes.GetElementVDofs(element, vdofs);
+   const int dof = vdofs.Size() / fes.GetVDim();
+   for (int j = 0; j < dof; j++)
+   {
+      state(vdofs[component * dof + j]) = value;
+   }
+}
+
+real_t SumALEElementComponent(FiniteElementSpace &fes, const Vector &load,
+                              int element, int component)
+{
+   Array<int> vdofs;
+   fes.GetElementVDofs(element, vdofs);
+   const int dof = vdofs.Size() / fes.GetVDim();
+   real_t sum = 0.0;
+   for (int j = 0; j < dof; j++)
+   {
+      sum += load(vdofs[component * dof + j]);
+   }
+   return sum;
+}
+
+} // namespace
+
+TEST_CASE("ALE convection interior integrator", "[NonlinearForm]")
+{
+   Mesh mesh = Mesh::MakeCartesian2D(2, 1, Element::QUADRILATERAL,
+                                     false, 2.0, 1.0);
+   L2_FECollection fec(1, 2, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&mesh, &fec, 4, Ordering::byNODES);
+   Vector beta(1);
+   beta = 1.0;
+   NonlinearForm form(&fes);
+   form.AddInteriorFaceIntegrator(
+      new ALEConvectionInteriorIntegrator(1, 1.0, beta));
+
+   Vector state(fes.GetVSize());
+   Vector load(fes.GetVSize());
+   state = 0.0;
+   SetALEElementComponent(fes, state, 0, 0, 2.0);
+   SetALEElementComponent(fes, state, 1, 0, -1.0);
+   form.Mult(state, load);
+   REQUIRE(SumALEElementComponent(fes, load, 0, 0) ==
+           MFEM_Approx(0.0, 1e-12));
+   REQUIRE(SumALEElementComponent(fes, load, 1, 0) ==
+           MFEM_Approx(-1.5, 1e-12));
+
+   // A discontinuous grid velocity reverses the upwind side after averaging
+   // the two traces: average(u-w).n = -0.5 on this oriented face.
+   SetALEElementComponent(fes, state, 1, 2, 2.0);
+   form.Mult(state, load);
+   REQUIRE(SumALEElementComponent(fes, load, 0, 0) ==
+           MFEM_Approx(1.5, 1e-12));
+   REQUIRE(SumALEElementComponent(fes, load, 1, 0) ==
+           MFEM_Approx(0.0, 1e-12));
+}
+
 TEST_CASE("NonlinearForm Boundary Integrator", "[NonlinearForm]")
 {
    // See problem description in ex27.
