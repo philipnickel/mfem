@@ -39,6 +39,7 @@ set(SRCS
   integ/bilininteg_transpose_ea.cpp
   integ/bilininteg_vecdiffusion_mf.cpp
   integ/bilininteg_vecdiffusion_pa.cpp
+  integ/bilininteg_vecdivdiv_pa.cpp
   integ/bilininteg_vecdiv_pa.cpp
   integ/bilininteg_vecmass_mf.cpp
   integ/bilininteg_vecmass_pa.cpp

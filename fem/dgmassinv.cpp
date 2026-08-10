@@ -14,8 +14,50 @@
 #include "dgmassinv_kernels.hpp"
 #include "../general/forall.hpp"
 
+#include <cmath>
+#include <limits>
+
 namespace mfem
 {
+
+namespace
+{
+
+bool IsIdentityDofToQuad(const DofToQuad *maps)
+{
+   if (!maps || maps->mode != DofToQuad::TENSOR ||
+       maps->ndof != maps->nqpt)
+   {
+      return false;
+   }
+
+   const int n = maps->ndof;
+   if (maps->B.Size() != n*n || maps->Bt.Size() != n*n)
+   {
+      return false;
+   }
+
+   const real_t *B = maps->B.HostRead();
+   const real_t *Bt = maps->Bt.HostRead();
+   const real_t tol = 64.0*std::numeric_limits<real_t>::epsilon();
+   for (int d = 0; d < n; ++d)
+   {
+      for (int q = 0; q < n; ++q)
+      {
+         const real_t expected = (q == d) ? 1.0 : 0.0;
+         // Using <= also rejects NaN. Check both stored maps instead of
+         // inferring collocation from a named basis or quadrature family.
+         if (!(std::abs(B[q + n*d] - expected) <= tol) ||
+             !(std::abs(Bt[d + n*q] - expected) <= tol))
+         {
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
+} // namespace
 
 struct DGMassInvKernels { DGMassInvKernels(); };
 
@@ -28,15 +70,23 @@ DGMassInverse::DGMassInverse(const FiniteElementSpace &fes_orig,
          fes_orig.GetMesh()->Dimension(),
          btype,
          fes_orig.GetTypicalFE()->GetMapType()),
-     fes(fes_orig.GetMesh(), &fec)
+     fes(fes_orig.GetMesh(), &fec, 1, fes_orig.GetOrdering())
 {
    static DGMassInvKernels kernels;
 
-   MFEM_VERIFY(fes.IsDGSpace(), "Space must be DG.");
-   MFEM_VERIFY(!fes.IsVariableOrder(), "Variable orders not supported.");
+   MFEM_VERIFY(fes_orig.IsDGSpace(), "Space must be DG.");
+   MFEM_VERIFY(!fes_orig.IsVariableOrder(), "Variable orders not supported.");
+   const auto *l2_fec =
+      dynamic_cast<const L2_FECollection*>(fes_orig.FEColl());
+   MFEM_VERIFY(l2_fec, "Space must use an L2 finite-element collection.");
+   const int vdim = fes_orig.GetVDim();
+   MFEM_VERIFY(vdim > 0, "Space must have positive vector dimension.");
+   MFEM_VERIFY(fes_orig.GetVSize() == vdim*fes.GetVSize() &&
+               fes_orig.GetTrueVSize() == vdim*fes.GetTrueVSize(),
+               "Original DG space must consist of copies of the internal "
+               "scalar DG space.");
 
-   const int btype_orig =
-      static_cast<const L2_FECollection*>(fes_orig.FEColl())->GetBasisType();
+   const int btype_orig = l2_fec->GetBasisType();
 
    if (btype_orig == btype)
    {
@@ -68,13 +118,17 @@ DGMassInverse::DGMassInverse(const FiniteElementSpace &fes_orig,
    if (coeff) { m = new MassIntegrator(*coeff, ir); }
    else { m = new MassIntegrator(ir); }
 
-   diag_inv.SetSize(height);
+   // The mass operator and its diagonal are scalar and shared by every
+   // component. The Krylov work vectors retain the input space's full size.
+   diag_inv.SetSize(fes.GetTrueVSize());
    // Workspace vectors used for CG
    r_.SetSize(height);
-   d_.SetSize(height);
-   z_.SetSize(height);
-   // Only need transformed RHS if basis is different
-   if (btype_orig != btype) { b2_.SetSize(height); }
+   // byVDIM is not component-contiguous. Keep its solution in byNODES layout
+   // during the batched solve, then scatter it back on completion.
+   if (vdim > 1 && fes_orig.GetOrdering() == Ordering::byVDIM)
+   {
+      b2_.SetSize(height);
+   }
 
    M.reset(new BilinearForm(&fes));
    M->AddDomainIntegrator(m); // M assumes ownership of m
@@ -113,6 +167,11 @@ void DGMassInverse::SetMaxIter(const int max_iter_) { max_iter = max_iter_; }
 void DGMassInverse::Update()
 {
    M->Assemble();
+   diagonal_mass = IsIdentityDofToQuad(m->maps);
+   // The identity-map path is an exact diagonal solve and never enters CG.
+   // Keep only the transformed-RHS workspace in that case.
+   d_.SetSize(diagonal_mass ? 0 : height);
+   z_.SetSize(diagonal_mass ? 0 : height);
    M->AssembleDiagonal(diag_inv);
    diag_inv.Reciprocal();
 }
@@ -127,17 +186,22 @@ void DGMassInverse::DGMassCGIteration(const Vector &b_, Vector &u_) const
    const int NE = fes.GetNE();
    const int d1d = m->dofs1D;
    const int q1d = m->quad1D;
-
    const int ND = static_cast<int>(pow(d1d, DIM));
+   const int scalar_size = ND*NE;
+   const int VDIM = height/scalar_size;
+   const bool BY_VDIM = VDIM > 1 && fes.GetOrdering() == Ordering::byVDIM;
+   const bool DIAGONAL_MASS = diagonal_mass;
 
-   const auto B = m->maps->B.Read();
-   const auto Bt = m->maps->Bt.Read();
-   const auto pa_data = m->pa_data.Read();
+   const real_t *B = DIAGONAL_MASS ? nullptr : m->maps->B.Read();
+   const real_t *Bt = DIAGONAL_MASS ? nullptr : m->maps->Bt.Read();
+   const real_t *pa_data = DIAGONAL_MASS ? nullptr : m->pa_data.Read();
    const auto dinv = diag_inv.Read();
+   const auto b_orig = b_.Read();
    auto r = r_.Write();
-   auto d = d_.Write();
-   auto z = z_.Write();
-   auto u = u_.ReadWrite();
+   real_t *d = DIAGONAL_MASS ? nullptr : d_.Write();
+   real_t *z = DIAGONAL_MASS ? nullptr : z_.Write();
+   auto u_orig = u_.ReadWrite();
+   auto u = BY_VDIM ? b2_.Write() : u_orig;
 
    const real_t RELTOL = rel_tol;
    const real_t ABSTOL = abs_tol;
@@ -145,13 +209,6 @@ void DGMassInverse::DGMassCGIteration(const Vector &b_, Vector &u_) const
    const bool IT_MODE = iterative_mode;
    const bool CHANGE_BASIS = (d2q != nullptr);
 
-   // b is the right-hand side (if no change of basis, this just points to the
-   // incoming RHS vector, if we have to change basis, this points to the
-   // internal b2 vector where we put the transformed RHS)
-   const real_t *b;
-   // the following are non-null if we have to change basis
-   real_t *b2 = nullptr; // non-const access to b2
-   const real_t *b_orig = nullptr; // RHS vector in "original" basis
    const real_t *d2q_B = nullptr; // matrix to transform initial guess
    const real_t *q2d_B = nullptr; // matrix to transform solution
    const real_t *q2d_Bt = nullptr; // matrix to transform RHS
@@ -160,112 +217,147 @@ void DGMassInverse::DGMassCGIteration(const Vector &b_, Vector &u_) const
       d2q_B = d2q->B.Read();
       q2d_B = B_.Read();
       q2d_Bt = Bt_.Read();
-
-      b2 = b2_.Write();
-      b_orig = b_.Read();
-      b = b2;
-   }
-   else
-   {
-      b = b_.Read();
    }
 
    static constexpr int NB = Q1D ? Q1D : 1; // block size
 
-   mfem::forall_2D(NE, NB, NB, [=] MFEM_HOST_DEVICE (int e)
+   // Keep the components of each element adjacent in the launch order so the
+   // second component reuses its basis and PA data from cache on CPUs. Each
+   // component retains an independent element-local CG recurrence.
+   mfem::forall_2D(NE*VDIM, NB, NB, [=] MFEM_HOST_DEVICE (int ec)
    {
+      const int c = ec % VDIM;
+      const int e = ec / VDIM;
+      const int offset = c*scalar_size;
+      const real_t *rc = r + offset;
+      const real_t *dc = DIAGONAL_MASS ? nullptr : d + offset;
+      const real_t *zc = DIAGONAL_MASS ? nullptr : z + offset;
+      real_t *rw = r + offset;
+      real_t *dw = DIAGONAL_MASS ? nullptr : d + offset;
+      real_t *zw = DIAGONAL_MASS ? nullptr : z + offset;
+      real_t *uw = u + offset;
+
+      const int tid = MFEM_THREAD_ID(x) + NB*MFEM_THREAD_ID(y);
+      const int bxy = MFEM_THREAD_SIZE(x)*MFEM_THREAD_SIZE(y);
+      auto R = DeviceMatrix(rw, ND, NE);
+      auto U = DeviceMatrix(uw, ND, NE);
+
+      // Gather the RHS into the component-contiguous recurrence layout. For a
+      // byVDIM input, gather the initial guess as well; its solution remains in
+      // b2_ until the final scatter, so arbitrary component layouts are safe.
+      for (int i = tid; i < ND; i += bxy)
+      {
+         const int sdof = i + ND*e;
+         const int vdof = BY_VDIM ? c + VDIM*sdof : sdof + offset;
+         R(i,e) = b_orig[vdof];
+         if (!DIAGONAL_MASS)
+         {
+            if (!IT_MODE) { U(i,e) = 0.0; }
+            else if (BY_VDIM) { U(i,e) = u_orig[vdof]; }
+         }
+      }
+      MFEM_SYNC_THREAD;
+
       // Perform change of basis if needed
       if (CHANGE_BASIS)
       {
          // Transform RHS
-         DGMassBasis<DIM,D1D>(e, NE, q2d_Bt, b_orig, b2, d1d);
-         if (IT_MODE)
+         DGMassBasis<DIM,D1D>(e, NE, q2d_Bt, rw, rw, d1d);
+         if (IT_MODE && !DIAGONAL_MASS)
          {
             // Transform initial guess
-            DGMassBasis<DIM,D1D>(e, NE, d2q_B, u, u, d1d);
+            DGMassBasis<DIM,D1D>(e, NE, d2q_B, uw, uw, d1d);
          }
       }
 
-      const int tid = MFEM_THREAD_ID(x) + NB*MFEM_THREAD_ID(y);
-
-      // Compute first residual
-      if (IT_MODE)
+      // A square identity dof-to-quadrature map makes B^T D B exactly
+      // diagonal. In that structural case the assembled diagonal is the
+      // inverse itself and no element-local Krylov recurrence is needed.
+      if (DIAGONAL_MASS)
       {
-         DGMassApply<DIM,D1D,Q1D>(e, NE, B, Bt, pa_data, u, r, d1d, q1d);
-         DGMassAxpy(e, NE, ND, 1.0, b, -1.0, r, r); // r = b - r
+         DGMassPreconditioner(e, NE, ND, dinv, rc, uw);
       }
       else
       {
-         // if not in iterative mode, use zero initial guess
-         const int BX = MFEM_THREAD_SIZE(x);
-         const int BY = MFEM_THREAD_SIZE(y);
-         const int bxy = BX*BY;
-         const auto B = ConstDeviceMatrix(b, ND, NE);
-         auto U = DeviceMatrix(u, ND, NE);
-         auto R = DeviceMatrix(r, ND, NE);
-         for (int i = tid; i < ND; i += bxy)
+         // Compute first residual
+         if (IT_MODE)
          {
-            U(i, e) = 0.0;
-            R(i, e) = B(i, e);
+            DGMassApply<DIM,D1D,Q1D>(e, NE, B, Bt, pa_data,
+                                     uw, zw, d1d, q1d);
+            DGMassAxpy(e, NE, ND, 1.0, rc, -1.0, zc, rw); // r = b - A*u
          }
-         MFEM_SYNC_THREAD;
-      }
 
-      DGMassPreconditioner(e, NE, ND, dinv, r, z);
-      DGMassAxpy(e, NE, ND, 1.0, z, 0.0, z, d); // d = z
+         DGMassPreconditioner(e, NE, ND, dinv, rc, zw);
+         DGMassAxpy(e, NE, ND, 1.0, zc, 0.0, zc, dw); // d = z
 
-      real_t nom = DGMassDot<NB>(e, NE, ND, d, r);
-      if (nom < 0.0) { return; /* Not positive definite */ }
-      real_t r0 = fmax(nom*RELTOL*RELTOL, ABSTOL*ABSTOL);
-      if (nom <= r0) { return; /* Converged */ }
-
-      DGMassApply<DIM,D1D,Q1D>(e, NE, B, Bt, pa_data, d, z, d1d, q1d);
-      real_t den = DGMassDot<NB>(e, NE, ND, z, d);
-      if (den <= 0.0)
-      {
-         DGMassDot<NB>(e, NE, ND, d, d);
-         // d2 > 0 => not positive definite
-         if (den == 0.0) { return; }
-      }
-
-      // start iteration
-      int i = 1;
-      while (true)
-      {
-         const real_t alpha = nom/den;
-         DGMassAxpy(e, NE, ND, 1.0, u, alpha, d, u); // u = u + alpha*d
-         DGMassAxpy(e, NE, ND, 1.0, r, -alpha, z, r); // r = r - alpha*A*d
-
-         DGMassPreconditioner(e, NE, ND, dinv, r, z);
-
-         real_t betanom = DGMassDot<NB>(e, NE, ND, r, z);
-         if (betanom < 0.0) { return; /* Not positive definite */ }
-         if (betanom <= r0) { break; /* Converged */ }
-
-         if (++i > MAXIT) { break; }
-
-         const real_t beta = betanom/nom;
-         DGMassAxpy(e, NE, ND, 1.0, z, beta, d, d); // d = z + beta*d
-         DGMassApply<DIM,D1D,Q1D>(e, NE, B, Bt, pa_data, d, z, d1d, q1d); // z = A d
-         den = DGMassDot<NB>(e, NE, ND, d, z);
-         if (den <= 0.0)
+         real_t nom = DGMassDot<NB>(e, NE, ND, dc, rc);
+         real_t r0 = fmax(nom*RELTOL*RELTOL, ABSTOL*ABSTOL);
+         if (nom >= 0.0 && nom > r0)
          {
-            DGMassDot<NB>(e, NE, ND, d, d);
-            // d2 > 0 => not positive definite
-            if (den == 0.0) { break; }
+            DGMassApply<DIM,D1D,Q1D>(e, NE, B, Bt, pa_data,
+                                     dc, zw, d1d, q1d);
+            real_t den = DGMassDot<NB>(e, NE, ND, zc, dc);
+            if (den <= 0.0)
+            {
+               DGMassDot<NB>(e, NE, ND, dc, dc);
+               // d2 > 0 => not positive definite
+            }
+            if (den != 0.0)
+            {
+               // start iteration
+               int i = 1;
+               while (true)
+               {
+                  const real_t alpha = nom/den;
+                  DGMassAxpy(e, NE, ND, 1.0, uw, alpha, dc, uw);
+                  DGMassAxpy(e, NE, ND, 1.0, rc, -alpha, zc, rw);
+
+                  DGMassPreconditioner(e, NE, ND, dinv, rc, zw);
+
+                  real_t betanom = DGMassDot<NB>(e, NE, ND, rc, zc);
+                  if (betanom < 0.0 || betanom <= r0) { break; }
+                  if (++i > MAXIT) { break; }
+
+                  const real_t beta = betanom/nom;
+                  DGMassAxpy(e, NE, ND, 1.0, zc, beta, dc, dw);
+                  DGMassApply<DIM,D1D,Q1D>(e, NE, B, Bt, pa_data,
+                                           dc, zw, d1d, q1d);
+                  den = DGMassDot<NB>(e, NE, ND, dc, zc);
+                  if (den <= 0.0)
+                  {
+                     DGMassDot<NB>(e, NE, ND, dc, dc);
+                     // d2 > 0 => not positive definite
+                     if (den == 0.0) { break; }
+                  }
+                  nom = betanom;
+               }
+            }
          }
-         nom = betanom;
       }
 
       if (CHANGE_BASIS)
       {
-         DGMassBasis<DIM,D1D>(e, NE, q2d_B, u, u, d1d);
+         DGMassBasis<DIM,D1D>(e, NE, q2d_B, uw, uw, d1d);
+      }
+
+      if (BY_VDIM)
+      {
+         for (int i = tid; i < ND; i += bxy)
+         {
+            const int sdof = i + ND*e;
+            u_orig[c + VDIM*sdof] = U(i,e);
+         }
+         MFEM_SYNC_THREAD;
       }
    });
 }
 
 void DGMassInverse::Mult(const Vector &Mu, Vector &u) const
 {
+   MFEM_VERIFY(Mu.Size() == width && u.Size() == height,
+               "Input and output vectors have incompatible sizes.");
+   if (height == 0) { return; }
+
    // Dispatch to templated version based on dim, d1d, and q1d.
    const int dim = fes.GetMesh()->Dimension();
    const int d1d = m->dofs1D;

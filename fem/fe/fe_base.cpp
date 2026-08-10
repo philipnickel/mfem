@@ -674,6 +674,8 @@ const
       const int nqpt = ir.GetNPoints();
 
       const int b_dim = (range_type == VECTOR) ? dim : 1;
+      MFEM_ASSERT(lex_ordering.Size() == 0 || lex_ordering.Size() == dof,
+                  "Invalid lexicographic ordering size.");
 
       for (int i = 0; i < nqpt; i++)
       {
@@ -681,7 +683,11 @@ const
          {
             for (int j = 0; j < dof; j++)
             {
-               const double val = d2q.B[i + nqpt*(d+b_dim*lex_ordering[j])];
+               // Tensor-product L2 elements use an empty permutation to
+               // denote that their native ordering is already
+               // lexicographic.
+               const int native_j = lex_ordering.Size() ? lex_ordering[j] : j;
+               const double val = d2q.B[i + nqpt*(d+b_dim*native_j)];
                d2q_new->B[i+nqpt*(d+b_dim*j)] = val;
                d2q_new->Bt[j+dof*(i+nqpt*d)] = val;
             }
@@ -705,7 +711,8 @@ const
          {
             for (int j = 0; j < dof; j++)
             {
-               const double val = d2q.G[i + nqpt*(d+g_dim*lex_ordering[j])];
+               const int native_j = lex_ordering.Size() ? lex_ordering[j] : j;
+               const double val = d2q.G[i + nqpt*(d+g_dim*native_j)];
                d2q_new->G[i+nqpt*(d+g_dim*j)] = val;
                d2q_new->Gt[j+dof*(i+nqpt*d)] = val;
             }

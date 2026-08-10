@@ -113,6 +113,19 @@ real_t div_non_solenoidal_field3d(const Vector &x)
    return 2*(x(0) + x(1) + x(2));
 }
 
+class ElementP0Coefficient : public Coefficient
+{
+private:
+   const Vector &values;
+
+public:
+   explicit ElementP0Coefficient(const Vector &values_) : values(values_) { }
+
+   real_t Eval(ElementTransformation &T,
+               const IntegrationPoint &) override
+   { return values[T.ElementNo]; }
+};
+
 void pa_divergence_testnd(int dim,
                           void (*f1)(const Vector &, Vector &),
                           real_t (*divf1)(const Vector &))
@@ -211,6 +224,95 @@ TEST_CASE("PA VectorDivergence", "[PartialAssembly], [GPU]")
       // Check transpose
       pa_divergence_transpose_testnd(3);
    }
+}
+
+TEST_CASE("PA VectorDivDiv on curved L2 elements",
+          "[PartialAssembly][GPU][VectorDivDiv]")
+{
+   constexpr int order = 3;
+   const int q1d = GENERATE(order + 1, order + 2);
+   CAPTURE(q1d);
+   Mesh mesh = Mesh::MakeCartesian2D(
+                  3, 2, Element::QUADRILATERAL, true, 1.0, 1.0);
+   mesh.SetCurvature(order, false, 2, Ordering::byNODES);
+   mesh.Transform([](const Vector &xold, Vector &xnew)
+   {
+      xnew = xold;
+      xnew(1) += 0.08*sin(M_PI*xold(0))*sin(M_PI*xold(1));
+   });
+
+   L2_FECollection fec(order, 2, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&mesh, &fec, 2, Ordering::byNODES);
+   const IntegrationRule &ir = IntRules.Get(Geometry::SQUARE, 2*q1d - 2);
+
+   Vector tau(mesh.GetNE());
+   for (int e = 0; e < tau.Size(); ++e) { tau[e] = 0.2 + 0.07*e; }
+
+   BilinearForm pa(&fes);
+   pa.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   auto *pa_integ = new VectorDivDivIntegrator;
+   pa_integ->SetElementCoefficient(tau);
+   pa_integ->SetIntRule(&ir);
+   pa.AddDomainIntegrator(pa_integ);
+   pa.Assemble();
+
+   ElementP0Coefficient lambda(tau);
+   ConstantCoefficient zero(0.0);
+   BilinearForm assembled(&fes);
+   auto *reference = new ElasticityIntegrator(lambda, zero);
+   reference->SetIntRule(&ir);
+   assembled.AddDomainIntegrator(reference);
+   assembled.Assemble();
+   assembled.Finalize();
+
+   GridFunction x(&fes), y_pa(&fes), y_assembled(&fes);
+   x.Randomize(17);
+   pa.Mult(x, y_pa);
+   assembled.Mult(x, y_assembled);
+
+   Vector error(y_pa);
+   error -= y_assembled;
+   const real_t reference_norm = y_assembled.Norml2();
+   REQUIRE(error.Norml2() <= 2e-12*std::max(reference_norm, real_t(1.0)));
+
+   // SetElementCoefficient owns a fresh copy. Reassembly must replace, rather
+   // than accumulate onto, the old quadrature data.
+   constexpr real_t coefficient_scale = 1.75;
+   Vector original(y_pa);
+   GridFunction scaled(&fes);
+   tau *= coefficient_scale;
+   pa_integ->SetElementCoefficient(tau);
+   pa.Assemble();
+   pa.Mult(x, scaled);
+   scaled.Add(-coefficient_scale, original);
+   REQUIRE(scaled.Norml2() <=
+           2e-12*std::max(original.Norml2(), real_t(1.0)));
+}
+
+TEST_CASE("Empty L2 lexicographic permutation uses native ordering",
+          "[DofToQuad][VectorDivDiv]")
+{
+   constexpr int order = 3;
+   Mesh mesh = Mesh::MakeCartesian2D(
+                  1, 1, Element::QUADRILATERAL, true, 1.0, 1.0);
+   L2_FECollection fec(order, 2, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&mesh, &fec);
+   const FiniteElement &fe = *fes.GetTypicalFE();
+   const auto &nodal_fe = dynamic_cast<const NodalFiniteElement &>(fe);
+   REQUIRE(nodal_fe.GetLexicographicOrdering().Size() == 0);
+
+   const IntegrationRule &ir = IntRules.Get(Geometry::SQUARE, 2*order);
+   const DofToQuad &native = fe.GetDofToQuad(ir, DofToQuad::FULL);
+   const DofToQuad &lex = fe.GetDofToQuad(ir, DofToQuad::LEXICOGRAPHIC_FULL);
+
+   REQUIRE(lex.B.Size() == native.B.Size());
+   REQUIRE(lex.Bt.Size() == native.Bt.Size());
+   REQUIRE(lex.G.Size() == native.G.Size());
+   REQUIRE(lex.Gt.Size() == native.Gt.Size());
+   for (int i = 0; i < native.B.Size(); ++i) { REQUIRE(lex.B[i] == native.B[i]); }
+   for (int i = 0; i < native.Bt.Size(); ++i) { REQUIRE(lex.Bt[i] == native.Bt[i]); }
+   for (int i = 0; i < native.G.Size(); ++i) { REQUIRE(lex.G[i] == native.G[i]); }
+   for (int i = 0; i < native.Gt.Size(); ++i) { REQUIRE(lex.Gt[i] == native.Gt[i]); }
 }
 
 real_t f1(const Vector &x)

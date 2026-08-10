@@ -179,6 +179,120 @@ TEST_CASE("Mass Boundary Diagonal PA", "[PartialAssembly][AssembleDiagonal]")
    REQUIRE(diag_pa.Normlinf() == MFEM_Approx(0.0));
 }
 
+TEST_CASE("DG diffusion face diagonal PA",
+          "[PartialAssembly][AssembleDiagonal][DGDiffusion]")
+{
+   const int dimension = GENERATE(2, 3);
+   const int order = GENERATE(1, 2, 3);
+   const bool supplied_gauss_rule = GENERATE(false, true);
+   const int elements = 2;
+
+   CAPTURE(dimension, order, supplied_gauss_rule);
+
+   Mesh mesh = dimension == 2
+               ? Mesh::MakeCartesian2D(elements, elements,
+                                       Element::QUADRILATERAL, 1, 1.0, 1.0)
+               : Mesh::MakeCartesian3D(elements, elements, elements,
+                                       Element::HEXAHEDRON, 1.0, 1.0, 1.0);
+   mesh.SetCurvature(std::max(order, 2));
+   Vector perturbation(mesh.GetNodes()->Size());
+   perturbation.Randomize(20260809);
+   perturbation -= 0.5;
+   perturbation *= 0.01/elements;
+   mesh.MoveNodes(perturbation);
+
+   L2_FECollection collection(order, dimension, BasisType::GaussLobatto);
+   FiniteElementSpace space(&mesh, &collection);
+   const real_t sigma = -1.0;
+   const real_t kappa = (order + 1) * (order + 1);
+   IntegrationRules gauss_lobatto_rules(0, Quadrature1D::GaussLobatto);
+   IntegrationRules gauss_rules(0, Quadrature1D::GaussLegendre);
+   const Geometry::Type volume_geometry =
+      dimension == 2 ? Geometry::SQUARE : Geometry::CUBE;
+   const Geometry::Type face_geometry =
+      dimension == 2 ? Geometry::SEGMENT : Geometry::SQUARE;
+   const IntegrationRule &volume_rule =
+      gauss_lobatto_rules.Get(volume_geometry, 2*order + 1);
+   const IntegrationRule &face_rule = supplied_gauss_rule
+                                      ? gauss_rules.Get(face_geometry, 2*order)
+                                      : gauss_lobatto_rules.Get(face_geometry,
+                                                                2*order);
+   FunctionCoefficient penalty_weight(coeffFunction);
+
+   Array<int> boundary_marker(mesh.bdr_attributes.Max());
+   for (int attribute = 0; attribute < boundary_marker.Size(); ++attribute)
+   {
+      boundary_marker[attribute] = attribute % 2;
+   }
+
+   BilinearForm partial(&space);
+   partial.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   auto *partial_volume = new DiffusionIntegrator;
+   auto *partial_interior = new DGDiffusionIntegrator(sigma, kappa);
+   auto *partial_boundary = new DGDiffusionIntegrator(sigma, kappa);
+   partial_volume->SetIntRule(&volume_rule);
+   partial_interior->SetIntRule(&face_rule);
+   partial_boundary->SetIntRule(&face_rule);
+   partial_interior->SetPenaltyCoefficient(penalty_weight);
+   partial_boundary->SetPenaltyCoefficient(penalty_weight);
+   partial.AddDomainIntegrator(partial_volume);
+   partial.AddInteriorFaceIntegrator(partial_interior);
+   partial.AddBdrFaceIntegrator(partial_boundary, boundary_marker);
+   partial.Assemble();
+   REQUIRE(partial.SupportsNativeFaceDiagonalAssembly());
+   Vector partial_diagonal(space.GetVSize());
+   partial.AssembleDiagonal(partial_diagonal);
+
+   // Probe the actual PA action, rather than legacy AssembleFaceMatrix. PA
+   // intentionally substitutes a Gauss--Lobatto rule of the supplied order;
+   // this comparison catches a diagonal that accidentally uses the supplied
+   // Gauss family instead.
+   Vector basis(space.GetVSize()), action(space.GetVSize());
+   Vector action_diagonal(space.GetVSize());
+   for (int dof = 0; dof < space.GetVSize(); ++dof)
+   {
+      basis = 0.0;
+      basis(dof) = 1.0;
+      partial.Mult(basis, action);
+      action_diagonal(dof) = action(dof);
+   }
+   partial_diagonal -= action_diagonal;
+   REQUIRE(partial_diagonal.Normlinf() == MFEM_Approx(0.0));
+
+   ConstantCoefficient one(1.0);
+   BilinearForm coefficient_form(&space);
+   coefficient_form.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   coefficient_form.AddInteriorFaceIntegrator(
+      new DGDiffusionIntegrator(one, sigma, kappa));
+   coefficient_form.Assemble();
+   REQUIRE_FALSE(coefficient_form.SupportsNativeFaceDiagonalAssembly());
+
+   H1_FECollection continuous_collection(order, dimension);
+   FiniteElementSpace continuous_space(&mesh, &continuous_collection);
+   BilinearForm continuous(&continuous_space);
+   continuous.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   continuous.AddInteriorFaceIntegrator(
+      new DGDiffusionIntegrator(sigma, kappa));
+   REQUIRE_FALSE(continuous.SupportsNativeFaceDiagonalAssembly());
+
+   if (dimension == 2 && order == 1 && !supplied_gauss_rule)
+   {
+      Mesh nonconforming_mesh = Mesh::MakeCartesian2D(
+                                   2, 1, Element::QUADRILATERAL);
+      nonconforming_mesh.EnsureNCMesh();
+      Array<int> refinements(1);
+      refinements[0] = 0;
+      nonconforming_mesh.GeneralRefinement(refinements, 1, 0);
+      REQUIRE(nonconforming_mesh.Nonconforming());
+      FiniteElementSpace nonconforming_space(&nonconforming_mesh, &collection);
+      BilinearForm nonconforming(&nonconforming_space);
+      nonconforming.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      nonconforming.AddInteriorFaceIntegrator(
+         new DGDiffusionIntegrator(sigma, kappa));
+      REQUIRE_FALSE(nonconforming.SupportsNativeFaceDiagonalAssembly());
+   }
+}
+
 TEST_CASE("Diffusion Diagonal PA", "[PartialAssembly][AssembleDiagonal]")
 {
    for (int dimension = 2; dimension < 4; ++dimension)

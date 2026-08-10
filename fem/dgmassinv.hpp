@@ -25,7 +25,9 @@ namespace mfem
 /// This class performs a @a local (diagonally preconditioned) conjugate
 /// gradient iteration for each element. Optionally, a change of basis is
 /// performed to iterate on a better-conditioned system. This class fully
-/// supports execution on device (GPU).
+/// supports execution on device (GPU). For vector-valued copies of a scalar
+/// DG space, each component is inverted independently in one batched action;
+/// both Ordering::byNODES and Ordering::byVDIM are supported.
 class DGMassInverse : public Solver
 {
 protected:
@@ -40,6 +42,7 @@ protected:
    real_t rel_tol = 1e-12; ///< Relative CG tolerance.
    real_t abs_tol = 1e-12; ///< Absolute CG tolerance.
    int max_iter = 100; ///< Maximum number of CG iterations;
+   bool diagonal_mass = false; ///< The PA mass map is structurally diagonal.
 
    /// @name Intermediate vectors needed for CG three-term recurrence.
    ///@{
@@ -62,7 +65,9 @@ public:
    ///
    /// The solution and right-hand side used for the solver are not affected by
    /// this basis (they correspond to the basis of @a fes_). @a btype is only
-   /// used internally, and only has an effect on the convergence rate.
+   /// used internally, and only has an effect on the convergence rate. If
+   /// @a fes_ has vector dimension greater than one, the scalar mass inverse is
+   /// applied independently to every component while preserving its ordering.
    DGMassInverse(const FiniteElementSpace &fes_,
                  int btype=BasisType::GaussLegendre);
    /// @brief Construct the DG inverse mass operator for @a fes_ with
@@ -113,6 +118,33 @@ public:
 
    using CGKernelType = void(DGMassInverse::*)(const Vector &b_, Vector &u) const;
    MFEM_REGISTER_KERNELS(CGKernels, CGKernelType, (int, int, int));
+};
+
+/** @brief Adapt a fixed DGMassInverse for use as an iterative-solver
+    preconditioner.
+
+    IterativeSolver::SetOperator forwards the system operator to its
+    preconditioner. DGMassInverse is tied to the finite-element space and mass
+    operator supplied at construction, so its own SetOperator deliberately
+    rejects that call. This non-owning adapter ignores the forwarded system
+    operator and applies the existing inverse directly, without the additional
+    full-vector clear performed by a one-block BlockDiagonalPreconditioner. */
+class DGMassInversePreconditioner : public Solver
+{
+private:
+   DGMassInverse &inverse;
+
+public:
+   explicit DGMassInversePreconditioner(DGMassInverse &inverse_)
+      : Solver(inverse_.Height(), inverse_.Width()), inverse(inverse_) { }
+
+   void Mult(const Vector &x, Vector &y) const override
+   { inverse.Mult(x, y); }
+
+   void MultTranspose(const Vector &x, Vector &y) const override
+   { inverse.MultTranspose(x, y); }
+
+   void SetOperator(const Operator &) override { }
 };
 
 } // namespace mfem

@@ -3985,6 +3985,138 @@ void DGDiffusionIntegrator::AssembleFaceMatrix(
    }
 }
 
+void DGDiffusionIntegrator::AssemblePAFaceDiagonal(
+   const FiniteElement &el1, const FiniteElement &el2,
+   FaceElementTransformations &Trans, Vector &diag)
+{
+   const int ndof1 = el1.GetDof();
+   const int ndof2 = Trans.Elem2No >= 0 ? el2.GetDof() : 0;
+   const bool kappa_is_nonzero = kappa != 0.0;
+
+   dim = el1.GetDim();
+   diag.SetSize(ndof1 + ndof2);
+   diag = 0.0;
+
+   nor.SetSize(dim);
+   nh.SetSize(dim);
+   ni.SetSize(dim);
+   adjJ.SetSize(dim);
+   if (MQ) { mq.SetSize(dim); }
+
+   shape1.SetSize(ndof1);
+   dshape1.SetSize(ndof1, dim);
+   dshape1dn.SetSize(ndof1);
+   if (ndof2)
+   {
+      shape2.SetSize(ndof2);
+      dshape2.SetSize(ndof2, dim);
+      dshape2dn.SetSize(ndof2);
+   }
+
+   // SetupPA uses the supplied rule's order but deliberately substitutes its
+   // internal Gauss--Lobatto family. Reproduce that exact discretization here
+   // instead of the legacy AssembleFaceMatrix rule family.
+   const int finite_element_order = ndof2 ? max(el1.GetOrder(), el2.GetOrder())
+                                          : el1.GetOrder();
+   const int integration_order = IntRule
+                                 ? IntRule->GetOrder()
+                                 : GetRule(finite_element_order,
+                                           Trans.GetGeometryType()).GetOrder();
+   const IntegrationRule *ir = &irs.Get(Trans.GetGeometryType(),
+                                         integration_order);
+
+   real_t *face_diag = diag.HostReadWrite();
+   for (int p = 0; p < ir->GetNPoints(); ++p)
+   {
+      const IntegrationPoint &ip = ir->IntPoint(p);
+      Trans.SetAllIntPoints(&ip);
+      const IntegrationPoint &eip1 = Trans.GetElement1IntPoint();
+      const IntegrationPoint &eip2 = Trans.GetElement2IntPoint();
+
+      if (dim == 1)
+      {
+         nor(0) = 2*eip1.x - 1.0;
+      }
+      else
+      {
+         CalcOrtho(Trans.Jacobian(), nor);
+      }
+
+      el1.CalcShape(eip1, shape1);
+      el1.CalcDShape(eip1, dshape1);
+      real_t w = ip.weight/Trans.Elem1->Weight();
+      if (ndof2) { w /= 2.0; }
+      if (!MQ)
+      {
+         if (Q) { w *= Q->Eval(*Trans.Elem1, eip1); }
+         ni.Set(w, nor);
+      }
+      else
+      {
+         nh.Set(w, nor);
+         MQ->Eval(mq, *Trans.Elem1, eip1);
+         mq.MultTranspose(nh, ni);
+      }
+      CalcAdjugate(Trans.Elem1->Jacobian(), adjJ);
+      adjJ.Mult(ni, nh);
+
+      real_t wq = 0.0;
+      if (kappa_is_nonzero)
+      {
+         wq = KQ ? ip.weight * Trans.Face->Weight() *
+                    KQ->Eval(*Trans.Face, ip)
+                 : ni * nor;
+      }
+
+      dshape1.Mult(nh, dshape1dn);
+      for (int i = 0; i < ndof1; ++i)
+      {
+         face_diag[i] += (sigma - 1.0)*shape1(i)*dshape1dn(i);
+      }
+
+      if (ndof2)
+      {
+         el2.CalcShape(eip2, shape2);
+         el2.CalcDShape(eip2, dshape2);
+         w = ip.weight/2.0/Trans.Elem2->Weight();
+         if (!MQ)
+         {
+            if (Q) { w *= Q->Eval(*Trans.Elem2, eip2); }
+            ni.Set(w, nor);
+         }
+         else
+         {
+            nh.Set(w, nor);
+            MQ->Eval(mq, *Trans.Elem2, eip2);
+            mq.MultTranspose(nh, ni);
+         }
+         CalcAdjugate(Trans.Elem2->Jacobian(), adjJ);
+         adjJ.Mult(ni, nh);
+         if (kappa_is_nonzero && !KQ) { wq += ni * nor; }
+
+         dshape2.Mult(nh, dshape2dn);
+         for (int i = 0; i < ndof2; ++i)
+         {
+            face_diag[ndof1 + i] -=
+               (sigma - 1.0)*shape2(i)*dshape2dn(i);
+         }
+      }
+
+      if (kappa_is_nonzero)
+      {
+         wq *= kappa;
+         for (int i = 0; i < ndof1; ++i)
+         {
+            face_diag[i] += wq*shape1(i)*shape1(i);
+         }
+         for (int i = 0; i < ndof2; ++i)
+         {
+            face_diag[ndof1 + i] += wq*shape2(i)*shape2(i);
+         }
+      }
+   }
+}
+
 const IntegrationRule &DGDiffusionIntegrator::GetRule(
    int order, Geometry::Type geom)
 {

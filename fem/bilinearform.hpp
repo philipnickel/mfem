@@ -458,6 +458,16 @@ public:
        case. */
    void AssembleDiagonal(Vector &diag) const override;
 
+   /** @brief Return true when partial assembly includes native diagonal
+       accumulation for every registered interior and boundary face
+       integrator.
+
+       This capability query lets language bindings avoid reconstructing face
+       matrices one face at a time. It is currently limited to conforming,
+       scalar, uniform-order discontinuous spaces whose face integrators are
+       coefficient-compatible DGDiffusionIntegrator instances. */
+   bool SupportsNativeFaceDiagonalAssembly() const;
+
    /// Get the finite element space prolongation operator.
    const Operator *GetProlongation() const override
    { return fes->GetConformingProlongation(); }

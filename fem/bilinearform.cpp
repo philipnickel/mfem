@@ -821,6 +821,38 @@ void BilinearForm::AssembleDiagonal(Vector &diag) const
    cP->AbsMultTranspose(local_diag, diag);
 }
 
+bool BilinearForm::SupportsNativeFaceDiagonalAssembly() const
+{
+   const Mesh &mesh = *fes->GetMesh();
+   if (assembly != AssemblyLevel::PARTIAL || fes->GetVDim() != 1 ||
+       fes->IsVariableOrder() ||
+       fes->FEColl()->GetContType() != FiniteElementCollection::DISCONTINUOUS ||
+       mesh.Nonconforming() || mesh.Dimension() < 2 || mesh.Dimension() > 3 ||
+       !Geometry::IsTensorProduct(mesh.GetTypicalElementGeometry()))
+   {
+      return false;
+   }
+   for (int i = 0; i < interior_face_integs.Size(); ++i)
+   {
+      const auto *integrator =
+         dynamic_cast<const DGDiffusionIntegrator*>(interior_face_integs[i]);
+      if (!integrator || !integrator->SupportsPAFaceDiagonalAssembly())
+      {
+         return false;
+      }
+   }
+   for (int i = 0; i < boundary_face_integs.Size(); ++i)
+   {
+      const auto *integrator =
+         dynamic_cast<const DGDiffusionIntegrator*>(boundary_face_integs[i]);
+      if (!integrator || !integrator->SupportsPAFaceDiagonalAssembly())
+      {
+         return false;
+      }
+   }
+   return true;
+}
+
 void BilinearForm::FormLinearSystem(const Array<int> &ess_tdof_list, Vector &x,
                                     Vector &b, OperatorHandle &A, Vector &X,
                                     Vector &B, int copy_interior)

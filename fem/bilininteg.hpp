@@ -3074,6 +3074,40 @@ protected:
    }
 };
 
+/** @brief Integrator for
+    $\left(\tau \nabla \cdot u, \nabla \cdot v\right)$ where @a u and @a v
+    are two-component fields formed from copies of a scalar L2 space.
+
+    This integrator currently supports partial assembly on two-dimensional,
+    uniform-order tensor-product L2 spaces with Ordering::byNODES. The
+    coefficient is one nonnegative constant per local element. It is copied
+    into the integrator; after changing it with SetElementCoefficient(), the
+    owning BilinearForm must be reassembled before the next application. */
+class VectorDivDivIntegrator : public BilinearFormIntegrator
+{
+private:
+   Vector element_coefficient;
+   Vector pa_data;
+   const DofToQuad *maps = nullptr; ///< Not owned.
+   int ne = 0, dofs1D = 0, quad1D = 0;
+
+public:
+   VectorDivDivIntegrator() = default;
+   explicit VectorDivDivIntegrator(const Vector &element_coefficient_);
+
+   /// Copy one coefficient value per local element into the integrator.
+   void SetElementCoefficient(const Vector &element_coefficient_);
+
+   /// Return the internally owned element coefficient.
+   const Vector &GetElementCoefficient() const
+   { return element_coefficient; }
+
+   using BilinearFormIntegrator::AssemblePA;
+   void AssemblePA(const FiniteElementSpace &fes) override;
+   void AddMultPA(const Vector &x, Vector &y) const override;
+   void AddMultTransposePA(const Vector &x, Vector &y) const override;
+};
+
 /// $(Q \nabla \cdot u, \nabla \cdot v)$ for Raviart-Thomas elements
 class DivDivIntegrator: public BilinearFormIntegrator
 {
@@ -3565,6 +3599,29 @@ public:
    void AssembleFaceMatrix(const FiniteElement &el1, const FiniteElement &el2,
                            FaceElementTransformations &Trans,
                            DenseMatrix &elmat) override;
+
+   /** @brief Return true when the PA face diagonal has the same coefficient
+       semantics as this direct kernel. */
+   bool SupportsPAFaceDiagonalAssembly() const
+   {
+      // The PA kernel projects one face value of Q, whereas the legacy
+      // element kernel evaluates Q independently from both adjacent elements.
+      // Until the diagonal is formed directly from pa_data, advertise only
+      // the coefficient-free diffusion case for which the two are identical.
+      return Q == nullptr && MQ == nullptr;
+   }
+
+   /** @brief Assemble the diagonal of this integrator's partial-assembly face
+       action.
+
+       For an interior face, @a diag contains the element-1 block followed by
+       the element-2 block; a boundary face contains only element 1. The rule
+       follows AssemblePA* semantics and can intentionally differ from legacy
+       AssembleFaceMatrix(). */
+   void AssemblePAFaceDiagonal(const FiniteElement &el1,
+                               const FiniteElement &el2,
+                               FaceElementTransformations &Trans,
+                               Vector &diag);
 
    bool RequiresFaceNormalDerivatives() const override { return true; }
 
