@@ -2229,7 +2229,11 @@ TensorProductPRefinementTransferOperator(
    // must be sorted in lexicographical order
    for (int i = 0; i < ir.GetNPoints(); ++i)
    {
-      int j = hdofmap[i] >=0 ? hdofmap[i] : -1 - hdofmap[i];
+      // An empty tensor dof map denotes identity/lexicographic ordering. This
+      // is the standard L2 ordering, including the H1(p) -> L2(p) transfer
+      // used by continuous/discontinuous multigrid hierarchies.
+      const int mapped = hdofmap.Size() ? hdofmap[i] : i;
+      int j = mapped >= 0 ? mapped : -1 - mapped;
       irLex.IntPoint(i) = ir.IntPoint(j);
    }
 
@@ -2258,12 +2262,21 @@ TensorProductPRefinementTransferOperator(
    localL.UseDevice(true);
    localH.UseDevice(true);
 
-   MFEM_VERIFY(dynamic_cast<const ElementRestriction*>(elem_restrict_lex_h),
-               "High order element restriction is of unsupported type");
-
    mask.SetSize(localH.Size(), Device::GetMemoryType());
-   static_cast<const ElementRestriction*>(elem_restrict_lex_h)
-   ->BooleanMask(mask);
+   const ElementRestriction *conforming_restriction =
+      dynamic_cast<const ElementRestriction*>(elem_restrict_lex_h);
+   if (conforming_restriction)
+   {
+      conforming_restriction->BooleanMask(mask);
+   }
+   else
+   {
+      MFEM_VERIFY(dynamic_cast<const L2ElementRestriction*>(elem_restrict_lex_h),
+                  "High order element restriction is of unsupported type");
+      // Discontinuous element dofs are unique, so no duplicate-elimination
+      // mask is required when scattering the E-vector back to the L-vector.
+      mask = 1.0;
+   }
    mask.UseDevice(true);
 }
 

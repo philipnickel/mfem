@@ -425,6 +425,46 @@ TEST_CASE("Variable Order True Transfer", "[Transfer][VariableOrder]")
    delete c_fec;
 }
 
+TEST_CASE("Tensor product true transfer from H1 to L2", "[Transfer]")
+{
+   const int dim = GENERATE(2, 3);
+   const int order = GENERATE(2, 6);
+   CAPTURE(dim, order);
+
+   Mesh mesh = dim == 2 ?
+               Mesh::MakeCartesian2D(2, 1, Element::QUADRILATERAL,
+                                     true, 2.0, 1.0) :
+               Mesh::MakeCartesian3D(2, 1, 1, Element::HEXAHEDRON,
+                                     2.0, 1.0, 1.0);
+   H1_FECollection h1_fec(order, dim, BasisType::GaussLobatto);
+   L2_FECollection l2_fec(order, dim, BasisType::GaussLegendre);
+   FiniteElementSpace h1_fes(&mesh, &h1_fec);
+   FiniteElementSpace l2_fes(&mesh, &l2_fec);
+   TrueTransferOperator transfer(h1_fes, l2_fes);
+
+   dimension = dim;
+   coeff_order = 1;
+   FunctionCoefficient function(&coeff);
+   GridFunction coarse(&h1_fes), expected(&l2_fes);
+   coarse.ProjectCoefficient(function);
+   expected.ProjectCoefficient(function);
+   Vector interpolated(l2_fes.GetTrueVSize());
+   transfer.Mult(coarse, interpolated);
+   interpolated -= expected;
+   REQUIRE(interpolated.Normlinf() <= 1e-12);
+
+   Vector coarse_vector(h1_fes.GetTrueVSize());
+   Vector fine_vector(l2_fes.GetTrueVSize());
+   coarse_vector.Randomize(1701);
+   fine_vector.Randomize(1702);
+   Vector prolonged(l2_fes.GetTrueVSize());
+   Vector restricted(h1_fes.GetTrueVSize());
+   transfer.Mult(coarse_vector, prolonged);
+   transfer.MultTranspose(fine_vector, restricted);
+   REQUIRE(InnerProduct(prolonged, fine_vector) ==
+           Approx(InnerProduct(coarse_vector, restricted)).margin(1e-11));
+}
+
 TEST_CASE("Restriction Transpose Operator")
 {
    int order = GENERATE(1, 2);
