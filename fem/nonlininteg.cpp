@@ -497,7 +497,9 @@ static void PAALEConvectionInteriorApply2D(
 template<int T_D1D = 0, int T_Q1D = 0>
 static void PAALEFaceEvaluate3D(
    const int d1d, const int q1d, const int nf, const int vdim,
-   const DofToQuad &maps, const Vector &x_, Vector &state_)
+   const DofToQuad &maps, const Vector &x_, Vector &state_,
+   const int *attributes = nullptr, const int *marker = nullptr,
+   const int marker_size = 0)
 {
    const int D1D = T_D1D ? T_D1D : d1d;
    const int Q1D = T_Q1D ? T_Q1D : q1d;
@@ -511,6 +513,12 @@ static void PAALEFaceEvaluate3D(
       const int face = index / (2 * vdim);
       const int side = (index / vdim) % 2;
       const int field = index % vdim;
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
       real_t x_projected[max_D1D][max_Q1D];
       for (int d2 = 0; d2 < D1D; ++d2)
       {
@@ -542,7 +550,9 @@ static void PAALEFaceEvaluate3D(
 template<int T_D1D = 0, int T_Q1D = 0>
 static void PAALEFaceProject3D(
    const int d1d, const int q1d, const int nf, const int vdim,
-   const DofToQuad &maps, const Vector &flux_, Vector &y_)
+   const DofToQuad &maps, const Vector &flux_, Vector &y_,
+   const int *attributes = nullptr, const int *marker = nullptr,
+   const int marker_size = 0)
 {
    const int D1D = T_D1D ? T_D1D : d1d;
    const int Q1D = T_Q1D ? T_Q1D : q1d;
@@ -556,6 +566,12 @@ static void PAALEFaceProject3D(
       const int face = index / 6;
       const int side = (index / 3) % 2;
       const int component = index % 3;
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
       real_t x_projected[max_D1D][max_Q1D];
       for (int d2 = 0; d2 < D1D; ++d2)
       {
@@ -675,7 +691,8 @@ static void PAALEConvectionBoundaryApply2D(
    const Array<real_t> &weights, const DofToQuad &maps,
    const Vector &determinants, const Vector &normals,
    const Vector &datum_values, const Vector &beta_weights,
-   const Vector &x_, Vector &y_)
+   const Vector &x_, Vector &y_, const int *attributes = nullptr,
+   const int *marker = nullptr, const int marker_size = 0)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE boundary PA face size exceeds the configured limit");
@@ -694,6 +711,12 @@ static void PAALEConvectionBoundaryApply2D(
 
    mfem::forall(nf, [=] MFEM_HOST_DEVICE(int face)
    {
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
       real_t flux[ALE_FACE_MAX_Q1D][3];
       for (int q = 0; q < q1d; ++q)
       {
@@ -751,7 +774,9 @@ static void PAALEConvectionBoundaryApply3D(
    const Array<real_t> &weights, const DofToQuad &maps,
    const Vector &determinants, const Vector &normals,
    const Vector &datum_values, const Vector &beta_weights,
-   const Vector &x_, Vector &state_, Vector &flux_, Vector &y_)
+   const Vector &x_, Vector &state_, Vector &flux_, Vector &y_,
+   const int *attributes = nullptr, const int *marker = nullptr,
+   const int marker_size = 0)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE boundary PA face size exceeds the configured limit");
@@ -759,15 +784,18 @@ static void PAALEConvectionBoundaryApply3D(
    const int vdim = dim * (history_order + 1 + (continuity_scratch ? 1 : 0));
    if (d1d == 7 && q1d == 8)
    {
-      PAALEFaceEvaluate3D<7, 8>(d1d, q1d, nf, vdim, maps, x_, state_);
+      PAALEFaceEvaluate3D<7, 8>(d1d, q1d, nf, vdim, maps, x_, state_,
+                                attributes, marker, marker_size);
    }
    else if (d1d == 3 && q1d == 4)
    {
-      PAALEFaceEvaluate3D<3, 4>(d1d, q1d, nf, vdim, maps, x_, state_);
+      PAALEFaceEvaluate3D<3, 4>(d1d, q1d, nf, vdim, maps, x_, state_,
+                                attributes, marker, marker_size);
    }
    else
    {
-      PAALEFaceEvaluate3D<>(d1d, q1d, nf, vdim, maps, x_, state_);
+      PAALEFaceEvaluate3D<>(d1d, q1d, nf, vdim, maps, x_, state_,
+                            attributes, marker, marker_size);
    }
    auto det = Reshape(determinants.Read(), q1d, q1d, nf);
    auto normal = Reshape(normals.Read(), q1d, q1d, dim, nf);
@@ -784,6 +812,12 @@ static void PAALEConvectionBoundaryApply3D(
       const int q = index % (q1d * q1d);
       const int q1 = q % q1d;
       const int q2 = q / q1d;
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
       real_t speed = 0.0;
       for (int component = 0; component < dim; ++component)
       {
@@ -815,15 +849,18 @@ static void PAALEConvectionBoundaryApply3D(
 
    if (d1d == 7 && q1d == 8)
    {
-      PAALEFaceProject3D<7, 8>(d1d, q1d, nf, vdim, maps, flux_, y_);
+      PAALEFaceProject3D<7, 8>(d1d, q1d, nf, vdim, maps, flux_, y_,
+                               attributes, marker, marker_size);
    }
    else if (d1d == 3 && q1d == 4)
    {
-      PAALEFaceProject3D<3, 4>(d1d, q1d, nf, vdim, maps, flux_, y_);
+      PAALEFaceProject3D<3, 4>(d1d, q1d, nf, vdim, maps, flux_, y_,
+                               attributes, marker, marker_size);
    }
    else
    {
-      PAALEFaceProject3D<>(d1d, q1d, nf, vdim, maps, flux_, y_);
+      PAALEFaceProject3D<>(d1d, q1d, nf, vdim, maps, flux_, y_,
+                           attributes, marker, marker_size);
    }
 }
 
@@ -835,7 +872,9 @@ static void PAALEPressureBoundaryApply2D(
    const Vector &basis_, const Vector &derivative_,
    const Vector &inverse_jacobian_, const Array<int> &boundary_elements,
    const Vector &delta_weights, const Vector &face_x_,
-   const Vector &element_x_, Vector &face_y_)
+   const Vector &element_x_, Vector &face_y_,
+   const int *attributes = nullptr, const int *marker = nullptr,
+   const int marker_size = 0)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE pressure-boundary PA face size exceeds the configured limit");
@@ -858,6 +897,12 @@ static void PAALEPressureBoundaryApply2D(
 
    mfem::forall(nf, [=] MFEM_HOST_DEVICE(int face)
    {
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
       real_t flux[ALE_FACE_MAX_Q1D];
       const int element = elements[face];
       for (int q = 0; q < q1d; ++q)
@@ -937,7 +982,9 @@ static void PAALEPressureBoundaryApply3D(
    const Vector &basis_, const Vector &derivative_,
    const Vector &inverse_jacobian_, const Array<int> &boundary_elements,
    const Vector &delta_weights, const Vector &face_x_,
-   const Vector &element_x_, Vector &face_y_)
+   const Vector &element_x_, Vector &face_y_,
+   const int *attributes = nullptr, const int *marker = nullptr,
+   const int marker_size = 0)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE pressure-boundary PA face size exceeds the configured limit");
@@ -962,6 +1009,12 @@ static void PAALEPressureBoundaryApply3D(
 
    mfem::forall(nf, [=] MFEM_HOST_DEVICE(int face)
    {
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
       real_t flux[ALE_FACE_MAX_Q1D][ALE_FACE_MAX_Q1D];
       const int element = elements[face];
       for (int q2 = 0; q2 < q1d; ++q2)
@@ -1722,6 +1775,68 @@ void ALEConvectionBoundaryIntegrator::AddMultPAFace(
    }
 }
 
+void ALEConvectionBoundaryIntegrator::AddMultPAFace(
+   const Vector &face_x, const Vector &element_x,
+   const Array<int> &face_attributes, const Array<int> &marker,
+   Vector &face_y) const
+{
+   MFEM_VERIFY(face_attributes.Size() == nf,
+               "ALE boundary attributes do not match the PA face layout");
+   const int *attributes = face_attributes.Read();
+   const int *enabled = marker.Read();
+   const int marker_size = marker.Size();
+   const IntegrationRule &ir = *IntRule;
+
+   if (nf > 0 && include_convection)
+   {
+      MFEM_VERIFY(maps && geom,
+                  "assemble the ALE boundary PA kernel before applying it");
+      MFEM_VERIFY(beta->Size() == history_order,
+                  "ALE history weights changed size after construction");
+      if (dim == 2)
+      {
+         PAALEConvectionBoundaryApply2D(
+            history_order, include_continuity_scratch, upwind,
+            dofs1D, quad1D, nf, ir.GetWeights(), *maps,
+            geom->detJ, geom->normal, pa_datum, *beta, face_x, face_y,
+            attributes, enabled, marker_size);
+      }
+      else
+      {
+         PAALEConvectionBoundaryApply3D(
+            history_order, include_continuity_scratch, upwind,
+            dofs1D, quad1D, nf, ir.GetWeights(), *maps,
+            geom->detJ, geom->normal, pa_datum, *beta, face_x,
+            pa_state, pa_flux, face_y, attributes, enabled, marker_size);
+      }
+   }
+
+   if (nf == 0 || !include_pressure_delta) { return; }
+   MFEM_VERIFY(delta->Size() == history_order,
+               "ALE pressure weights changed size after construction");
+   MFEM_VERIFY(pa_basis.Size() && pa_derivative.Size() &&
+               pa_inverse_jacobian.Size(),
+               "assemble the ALE pressure-boundary PA kernel before applying it");
+   if (dim == 2)
+   {
+      PAALEPressureBoundaryApply2D(
+         history_order, include_continuity_scratch,
+         dofs1D, quad1D, nf, ne, ir.GetWeights(), *maps,
+         geom->detJ, geom->normal, pa_basis, pa_derivative,
+         pa_inverse_jacobian, pa_boundary_elements, *delta,
+         face_x, element_x, face_y, attributes, enabled, marker_size);
+   }
+   else
+   {
+      PAALEPressureBoundaryApply3D(
+         history_order, include_continuity_scratch,
+         dofs1D, quad1D, nf, ne, ir.GetWeights(), *maps,
+         geom->detJ, geom->normal, pa_basis, pa_derivative,
+         pa_inverse_jacobian, pa_boundary_elements, *delta,
+         face_x, element_x, face_y, attributes, enabled, marker_size);
+   }
+}
+
 real_t NonlinearFormIntegrator::GetLocalStateEnergyPA(const Vector &x) const
 {
    mfem_error ("NonlinearFormIntegrator::GetLocalStateEnergyPA(...)\n"
@@ -1773,6 +1888,32 @@ void NonlinearFormIntegrator::AddMultPAFace(
    const Vector &face_x, const Vector &, Vector &face_y) const
 {
    AddMultPA(face_x, face_y);
+}
+
+void NonlinearFormIntegrator::AddMultPAFace(
+   const Vector &face_x, const Vector &element_x,
+   const Array<int> &face_attributes, const Array<int> &marker,
+   Vector &face_y) const
+{
+   AddMultPAFace(face_x, element_x, face_y);
+   const int faces = face_attributes.Size();
+   const int face_dofs = faces ? face_y.Size() / faces : 0;
+   const auto attributes = face_attributes.Read();
+   const auto enabled = marker.Read();
+   const int marker_size = marker.Size();
+   auto output = face_y.ReadWrite();
+   mfem::forall(faces, [=] MFEM_HOST_DEVICE(int face)
+   {
+      const int attribute = attributes[face];
+      if (attribute <= 0 || attribute > marker_size ||
+          enabled[attribute - 1] == 0)
+      {
+         for (int dof = 0; dof < face_dofs; ++dof)
+         {
+            output[face * face_dofs + dof] = 0.0;
+         }
+      }
+   });
 }
 
 void NonlinearFormIntegrator::AddMultGradPA(const Vector&, Vector&) const

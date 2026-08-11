@@ -98,10 +98,15 @@ void PANonlinearFormExtension::Assemble()
 
 void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
 {
-   if (!DeviceCanUseCeed())
+   const bool use_ceed = DeviceCanUseCeed();
+   const bool need_element_x = !use_ceed ||
+      (int_face_restriction && fnfi.Size()) ||
+      (bdr_face_restriction && bfnfi.Size());
+   if (need_element_x) { elemR->Mult(x, xe); }
+
+   if (!use_ceed)
    {
       ye = 0.0;
-      elemR->Mult(x, xe);
       for (int i = 0; i < dnfi.Size(); ++i) { dnfi[i]->AddMultPA(xe, ye); }
       elemR->MultTranspose(ye, y);
    }
@@ -117,7 +122,6 @@ void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
 
    if (int_face_restriction && fnfi.Size())
    {
-      elemR->Mult(x, xe);
       const Vector *face_source = &x;
 #ifdef MFEM_USE_MPI
       ParGridFunction parallel_source;
@@ -139,11 +143,8 @@ void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
 
    if (bdr_face_restriction && bfnfi.Size())
    {
-      elemR->Mult(x, xe);
       bdr_face_restriction->Mult(x, bdr_face_x);
       bdr_face_y = 0.0;
-      const int faces = bdr_face_attributes->Size();
-      const int face_dofs = faces ? bdr_face_y.Size() / faces : 0;
       for (int i = 0; i < bfnfi.Size(); ++i)
       {
          const Array<int> *marker = bfnfi_marker[i];
@@ -153,23 +154,8 @@ void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
             continue;
          }
          bdr_face_work = 0.0;
-         bfnfi[i]->AddMultPAFace(bdr_face_x, xe, bdr_face_work);
-         const auto attributes = bdr_face_attributes->Read();
-         const auto enabled = marker->Read();
-         const int marker_size = marker->Size();
-         auto work = bdr_face_work.ReadWrite();
-         mfem::forall(faces, [=] MFEM_HOST_DEVICE(int face)
-         {
-            const int attribute = attributes[face];
-            if (attribute <= 0 || attribute > marker_size ||
-                enabled[attribute - 1] == 0)
-            {
-               for (int dof = 0; dof < face_dofs; ++dof)
-               {
-                  work[face * face_dofs + dof] = 0.0;
-               }
-            }
-         });
+         bfnfi[i]->AddMultPAFace(bdr_face_x, xe, *bdr_face_attributes,
+                                 *marker, bdr_face_work);
          bdr_face_y += bdr_face_work;
       }
       bdr_face_restriction->AddMultTransposeInPlace(bdr_face_y, y);

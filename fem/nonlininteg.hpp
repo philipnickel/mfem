@@ -167,6 +167,19 @@ public:
    {
       delete ceedOp;
    }
+
+   /** @brief Partially assembled boundary-face action with an attribute
+       marker. The default evaluates the face action and filters its output;
+       integrators can override this method to skip inactive faces before
+       performing expensive quadrature work.
+
+       The method is kept at the end of the interface so that existing virtual
+       entries retain their positions. */
+   virtual void AddMultPAFace(const Vector &face_x,
+                              const Vector &element_x,
+                              const Array<int> &face_attributes,
+                              const Array<int> &marker,
+                              Vector &face_y) const;
 };
 
 /** @brief Native volume integrator for a packed explicit ALE history.
@@ -291,6 +304,12 @@ public:
 
    void AddMultPAFace(const Vector &face_x,
                       const Vector &element_x,
+                      Vector &face_y) const override;
+
+   void AddMultPAFace(const Vector &face_x,
+                      const Vector &element_x,
+                      const Array<int> &face_attributes,
+                      const Array<int> &marker,
                       Vector &face_y) const override;
 };
 
