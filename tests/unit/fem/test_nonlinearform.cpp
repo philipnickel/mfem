@@ -185,7 +185,7 @@ TEST_CASE("ALE volume partial assembly matches legacy",
           "[NonlinearForm][PartialAssembly]")
 {
    const int dim = GENERATE(2, 3);
-   const int degree = 2;
+   const int degree = GENERATE(2, 6);
    const int history_order = 2;
    Mesh mesh = dim == 2 ?
       Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL,
@@ -200,7 +200,8 @@ TEST_CASE("ALE volume partial assembly matches legacy",
    beta(1) = -0.15;
    const Geometry::Type element_geometry =
       dim == 2 ? Geometry::SQUARE : Geometry::CUBE;
-   const IntegrationRule &rule = IntRules.Get(element_geometry, 7);
+   const IntegrationRule &rule =
+      IntRules.Get(element_geometry, 2 * degree + 2);
 
    NonlinearForm legacy(&fes);
    auto *legacy_integrator =
@@ -238,7 +239,7 @@ TEST_CASE("ALE interior partial assembly matches legacy",
           "[NonlinearForm][PartialAssembly]")
 {
    const int dim = GENERATE(2, 3);
-   const int degree = 2;
+   const int degree = GENERATE(2, 6);
    const int history_order = 2;
    Mesh mesh = dim == 2 ?
       Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL,
@@ -253,7 +254,8 @@ TEST_CASE("ALE interior partial assembly matches legacy",
    beta(1) = -0.2;
    const Geometry::Type face_geometry =
       dim == 2 ? Geometry::SEGMENT : Geometry::SQUARE;
-   const IntegrationRule &rule = IntRules.Get(face_geometry, 7);
+   const IntegrationRule &rule =
+      IntRules.Get(face_geometry, 2 * degree + 2);
 
    NonlinearForm legacy(&fes);
    auto *legacy_integrator =
@@ -294,7 +296,7 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
    const int dim = GENERATE(2, 3);
    const bool use_constant_datum = GENERATE(false, true);
    INFO("dim=" << dim << ", constant datum=" << use_constant_datum);
-   const int degree = 2;
+   const int degree = GENERATE(2, 6);
    const int history_order = 2;
    Mesh mesh = dim == 2 ?
       Mesh::MakeCartesian2D(2, 1, Element::QUADRILATERAL,
@@ -331,7 +333,8 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
    marker[0] = 1;
    const Geometry::Type face_geometry =
       dim == 2 ? Geometry::SEGMENT : Geometry::SQUARE;
-   const IntegrationRule &rule = IntRules.Get(face_geometry, 7);
+   const IntegrationRule &rule =
+      IntRules.Get(face_geometry, 2 * degree + 2);
 
    NonlinearForm legacy(&fes);
    auto *legacy_integrator = new ALEConvectionBoundaryIntegrator(

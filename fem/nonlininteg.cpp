@@ -124,136 +124,290 @@ static void PAALEConvectionVolumeApply2D(
    });
 }
 
-static void PAALEConvectionVolumeApply3D(
-   const int history_order, const int d1d, const int q1d, const int ne,
-   const Array<real_t> &weights, const DofToQuad &maps,
-   const Vector &jacobians, const Vector &beta_weights,
-   const Vector &x_, Vector &y_)
+template<int T_D1D = 0, int T_Q1D = 0>
+static void PAALETensorEvaluate3D(
+   const int d1d, const int q1d, const int ne, const int vdim,
+   const int gradient_vdim,
+   const DofToQuad &maps, const Vector &x_, Vector &state_, Vector &gradient_)
 {
-   MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
-               "ALE volume PA size exceeds the configured limit");
-   const int dim = 3;
-   const int vdim = dim * (history_order + 1);
-   auto B = Reshape(maps.B.Read(), q1d, d1d);
-   auto G = Reshape(maps.G.Read(), q1d, d1d);
-   auto Bt = Reshape(maps.Bt.Read(), d1d, q1d);
-   auto J = Reshape(jacobians.Read(), q1d, q1d, q1d, dim, dim, ne);
-   auto beta = beta_weights.Read();
-   auto weight = weights.Read();
-   auto x = Reshape(x_.Read(), d1d, d1d, d1d, vdim, ne);
-   auto y = Reshape(y_.ReadWrite(), d1d, d1d, d1d, vdim, ne);
+   const int D1D = T_D1D ? T_D1D : d1d;
+   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   constexpr int max_D1D = T_D1D ? T_D1D : ALE_FACE_MAX_D1D;
+   constexpr int max_Q1D = T_Q1D ? T_Q1D : ALE_FACE_MAX_Q1D;
+   auto B = Reshape(maps.B.Read(), Q1D, D1D);
+   auto G = Reshape(maps.G.Read(), Q1D, D1D);
+   auto x = Reshape(x_.Read(), D1D, D1D, D1D, vdim, ne);
+   auto state = Reshape(state_.Write(), Q1D, Q1D, Q1D, vdim, ne);
+   auto gradient =
+      Reshape(gradient_.Write(), Q1D, Q1D, Q1D, gradient_vdim, 3, ne);
 
-   mfem::forall(ne, [=] MFEM_HOST_DEVICE(int element)
+   mfem::forall(ne * vdim, [=] MFEM_HOST_DEVICE(int index)
    {
-      real_t flux[ALE_FACE_MAX_Q1D][ALE_FACE_MAX_Q1D]
-                 [ALE_FACE_MAX_Q1D][3];
-      for (int q3 = 0; q3 < q1d; ++q3)
+      const int element = index / vdim;
+      const int field = index % vdim;
+      const bool differentiate = field < gradient_vdim;
+      real_t u[max_D1D][max_D1D][max_D1D];
+      real_t Bu[max_D1D][max_D1D][max_Q1D];
+      real_t Gu[max_D1D][max_D1D][max_Q1D];
+      real_t BBu[max_D1D][max_Q1D][max_Q1D];
+      real_t GBu[max_D1D][max_Q1D][max_Q1D];
+      real_t BGu[max_D1D][max_Q1D][max_Q1D];
+
+      for (int d3 = 0; d3 < D1D; ++d3)
       {
-         for (int q2 = 0; q2 < q1d; ++q2)
+         for (int d2 = 0; d2 < D1D; ++d2)
          {
-            for (int q1 = 0; q1 < q1d; ++q1)
+            for (int d1 = 0; d1 < D1D; ++d1)
             {
-               real_t state[12] = {0.0};
-               real_t gradient[12][3] = {{0.0}};
-               for (int d3 = 0; d3 < d1d; ++d3)
+               u[d3][d2][d1] = x(d1, d2, d3, field, element);
+            }
+            for (int q1 = 0; q1 < Q1D; ++q1)
+            {
+               real_t value = 0.0;
+               real_t derivative = 0.0;
+               for (int d1 = 0; d1 < D1D; ++d1)
                {
-                  for (int d2 = 0; d2 < d1d; ++d2)
+                  value += B(q1, d1) * u[d3][d2][d1];
+                  if (differentiate)
                   {
-                     for (int d1 = 0; d1 < d1d; ++d1)
-                     {
-                        const real_t b1 = B(q1, d1);
-                        const real_t b2 = B(q2, d2);
-                        const real_t b3 = B(q3, d3);
-                        const real_t basis = b1 * b2 * b3;
-                        const real_t derivative0 = G(q1, d1) * b2 * b3;
-                        const real_t derivative1 = b1 * G(q2, d2) * b3;
-                        const real_t derivative2 = b1 * b2 * G(q3, d3);
-                        for (int field = 0; field < vdim; ++field)
-                        {
-                           const real_t value =
-                              x(d1, d2, d3, field, element);
-                           state[field] += basis * value;
-                           gradient[field][0] += derivative0 * value;
-                           gradient[field][1] += derivative1 * value;
-                           gradient[field][2] += derivative2 * value;
-                        }
-                     }
+                     derivative += G(q1, d1) * u[d3][d2][d1];
                   }
                }
-
-               const real_t J11 = J(q1, q2, q3, 0, 0, element);
-               const real_t J12 = J(q1, q2, q3, 0, 1, element);
-               const real_t J13 = J(q1, q2, q3, 0, 2, element);
-               const real_t J21 = J(q1, q2, q3, 1, 0, element);
-               const real_t J22 = J(q1, q2, q3, 1, 1, element);
-               const real_t J23 = J(q1, q2, q3, 1, 2, element);
-               const real_t J31 = J(q1, q2, q3, 2, 0, element);
-               const real_t J32 = J(q1, q2, q3, 2, 1, element);
-               const real_t J33 = J(q1, q2, q3, 2, 2, element);
-               const real_t adjugate[3][3] =
+               Bu[d3][d2][q1] = value;
+               if (differentiate) { Gu[d3][d2][q1] = derivative; }
+            }
+         }
+      }
+      for (int d3 = 0; d3 < D1D; ++d3)
+      {
+         for (int q2 = 0; q2 < Q1D; ++q2)
+         {
+            for (int q1 = 0; q1 < Q1D; ++q1)
+            {
+               real_t value = 0.0;
+               real_t derivative1 = 0.0;
+               real_t derivative0 = 0.0;
+               for (int d2 = 0; d2 < D1D; ++d2)
                {
-                  {J22 * J33 - J23 * J32,
-                   J32 * J13 - J12 * J33,
-                   J12 * J23 - J22 * J13},
-                  {J31 * J23 - J21 * J33,
-                   J11 * J33 - J13 * J31,
-                   J21 * J13 - J11 * J23},
-                  {J21 * J32 - J31 * J22,
-                   J31 * J12 - J11 * J32,
-                   J11 * J22 - J12 * J21}
-               };
-               for (int component = 0; component < dim; ++component)
-               {
-                  real_t load = 0.0;
-                  for (int history = 0; history < history_order; ++history)
+                  value += B(q2, d2) * Bu[d3][d2][q1];
+                  if (differentiate)
                   {
-                     const int velocity = dim * history + component;
-                     for (int physical = 0; physical < dim; ++physical)
-                     {
-                        const real_t relative =
-                           state[dim * history + physical] -
-                           state[dim * history_order + physical];
-                        for (int reference = 0; reference < dim; ++reference)
-                        {
-                           load += beta[history] * relative *
-                              gradient[velocity][reference] *
-                              adjugate[reference][physical];
-                        }
-                     }
+                     derivative1 += G(q2, d2) * Bu[d3][d2][q1];
+                     derivative0 += B(q2, d2) * Gu[d3][d2][q1];
                   }
-                  const int q = q1 + q1d * (q2 + q1d * q3);
-                  flux[q1][q2][q3][component] = weight[q] * load;
+               }
+               BBu[d3][q2][q1] = value;
+               if (differentiate)
+               {
+                  GBu[d3][q2][q1] = derivative1;
+                  BGu[d3][q2][q1] = derivative0;
                }
             }
          }
       }
-
-      for (int d3 = 0; d3 < d1d; ++d3)
+      for (int q3 = 0; q3 < Q1D; ++q3)
       {
-         for (int d2 = 0; d2 < d1d; ++d2)
+         for (int q2 = 0; q2 < Q1D; ++q2)
          {
-            for (int d1 = 0; d1 < d1d; ++d1)
+            for (int q1 = 0; q1 < Q1D; ++q1)
             {
-               for (int component = 0; component < dim; ++component)
+               real_t value = 0.0;
+               real_t derivative0 = 0.0;
+               real_t derivative1 = 0.0;
+               real_t derivative2 = 0.0;
+               for (int d3 = 0; d3 < D1D; ++d3)
                {
-                  real_t load = 0.0;
-                  for (int q3 = 0; q3 < q1d; ++q3)
+                  value += B(q3, d3) * BBu[d3][q2][q1];
+                  if (differentiate)
                   {
-                     for (int q2 = 0; q2 < q1d; ++q2)
-                     {
-                        for (int q1 = 0; q1 < q1d; ++q1)
-                        {
-                           load += Bt(d1, q1) * Bt(d2, q2) * Bt(d3, q3) *
-                                   flux[q1][q2][q3][component];
-                        }
-                     }
+                     derivative0 += B(q3, d3) * BGu[d3][q2][q1];
+                     derivative1 += B(q3, d3) * GBu[d3][q2][q1];
+                     derivative2 += G(q3, d3) * BBu[d3][q2][q1];
                   }
-                  y(d1, d2, d3, component, element) += load;
+               }
+               state(q1, q2, q3, field, element) = value;
+               if (differentiate)
+               {
+                  gradient(q1, q2, q3, field, 0, element) = derivative0;
+                  gradient(q1, q2, q3, field, 1, element) = derivative1;
+                  gradient(q1, q2, q3, field, 2, element) = derivative2;
                }
             }
          }
       }
    });
+}
+
+template<int T_D1D = 0, int T_Q1D = 0>
+static void PAALETensorProject3D(
+   const int d1d, const int q1d, const int ne, const int vdim,
+   const DofToQuad &maps, const Vector &flux_, Vector &y_)
+{
+   const int D1D = T_D1D ? T_D1D : d1d;
+   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   constexpr int max_D1D = T_D1D ? T_D1D : ALE_FACE_MAX_D1D;
+   constexpr int max_Q1D = T_Q1D ? T_Q1D : ALE_FACE_MAX_Q1D;
+   auto Bt = Reshape(maps.Bt.Read(), D1D, Q1D);
+   auto flux = Reshape(flux_.Read(), Q1D, Q1D, Q1D, 3, ne);
+   auto y = Reshape(y_.ReadWrite(), D1D, D1D, D1D, vdim, ne);
+
+   mfem::forall(ne * 3, [=] MFEM_HOST_DEVICE(int index)
+   {
+      const int element = index / 3;
+      const int component = index % 3;
+      real_t z_projected[max_D1D][max_Q1D][max_Q1D];
+      real_t yz_projected[max_D1D][max_D1D][max_Q1D];
+      for (int d3 = 0; d3 < D1D; ++d3)
+      {
+         for (int q2 = 0; q2 < Q1D; ++q2)
+         {
+            for (int q1 = 0; q1 < Q1D; ++q1)
+            {
+               real_t value = 0.0;
+               for (int q3 = 0; q3 < Q1D; ++q3)
+               {
+                  value += Bt(d3, q3) *
+                           flux(q1, q2, q3, component, element);
+               }
+               z_projected[d3][q2][q1] = value;
+            }
+         }
+      }
+      for (int d3 = 0; d3 < D1D; ++d3)
+      {
+         for (int d2 = 0; d2 < D1D; ++d2)
+         {
+            for (int q1 = 0; q1 < Q1D; ++q1)
+            {
+               real_t value = 0.0;
+               for (int q2 = 0; q2 < Q1D; ++q2)
+               {
+                  value += Bt(d2, q2) * z_projected[d3][q2][q1];
+               }
+               yz_projected[d3][d2][q1] = value;
+            }
+         }
+      }
+      for (int d3 = 0; d3 < D1D; ++d3)
+      {
+         for (int d2 = 0; d2 < D1D; ++d2)
+         {
+            for (int d1 = 0; d1 < D1D; ++d1)
+            {
+               real_t value = 0.0;
+               for (int q1 = 0; q1 < Q1D; ++q1)
+               {
+                  value += Bt(d1, q1) * yz_projected[d3][d2][q1];
+               }
+               y(d1, d2, d3, component, element) += value;
+            }
+         }
+      }
+   });
+}
+
+static void PAALEConvectionVolumeApply3D(
+   const int history_order, const int d1d, const int q1d, const int ne,
+   const Array<real_t> &weights, const DofToQuad &maps,
+   const Vector &jacobians, const Vector &beta_weights,
+   const Vector &x_, Vector &state_, Vector &gradient_, Vector &flux_,
+   Vector &y_)
+{
+   MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
+               "ALE volume PA size exceeds the configured limit");
+   const int dim = 3;
+   const int vdim = dim * (history_order + 1);
+   const int gradient_vdim = dim * history_order;
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALETensorEvaluate3D<7, 8>(d1d, q1d, ne, vdim, gradient_vdim,
+                                  maps, x_, state_, gradient_);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALETensorEvaluate3D<3, 4>(d1d, q1d, ne, vdim, gradient_vdim,
+                                  maps, x_, state_, gradient_);
+   }
+   else
+   {
+      PAALETensorEvaluate3D<>(d1d, q1d, ne, vdim, gradient_vdim,
+                              maps, x_, state_, gradient_);
+   }
+   auto J = Reshape(jacobians.Read(), q1d, q1d, q1d, dim, dim, ne);
+   auto beta = beta_weights.Read();
+   auto weight = weights.Read();
+   auto state = Reshape(state_.Read(), q1d, q1d, q1d, vdim, ne);
+   auto gradient =
+      Reshape(gradient_.Read(), q1d, q1d, q1d, gradient_vdim, dim, ne);
+   auto flux = Reshape(flux_.Write(), q1d, q1d, q1d, dim, ne);
+
+   mfem::forall(ne * q1d * q1d * q1d,
+                [=] MFEM_HOST_DEVICE(int index)
+   {
+      const int element = index / (q1d * q1d * q1d);
+      int point = index % (q1d * q1d * q1d);
+      const int q1 = point % q1d;
+      point /= q1d;
+      const int q2 = point % q1d;
+      const int q3 = point / q1d;
+      const real_t J11 = J(q1, q2, q3, 0, 0, element);
+      const real_t J12 = J(q1, q2, q3, 0, 1, element);
+      const real_t J13 = J(q1, q2, q3, 0, 2, element);
+      const real_t J21 = J(q1, q2, q3, 1, 0, element);
+      const real_t J22 = J(q1, q2, q3, 1, 1, element);
+      const real_t J23 = J(q1, q2, q3, 1, 2, element);
+      const real_t J31 = J(q1, q2, q3, 2, 0, element);
+      const real_t J32 = J(q1, q2, q3, 2, 1, element);
+      const real_t J33 = J(q1, q2, q3, 2, 2, element);
+      const real_t adjugate[3][3] =
+      {
+         {J22 * J33 - J23 * J32,
+          J32 * J13 - J12 * J33,
+          J12 * J23 - J22 * J13},
+         {J31 * J23 - J21 * J33,
+          J11 * J33 - J13 * J31,
+          J21 * J13 - J11 * J23},
+         {J21 * J32 - J31 * J22,
+          J31 * J12 - J11 * J32,
+          J11 * J22 - J12 * J21}
+      };
+      for (int component = 0; component < dim; ++component)
+      {
+         real_t load = 0.0;
+         for (int history = 0; history < history_order; ++history)
+         {
+            const int velocity = dim * history + component;
+            for (int physical = 0; physical < dim; ++physical)
+            {
+               const real_t relative =
+                  state(q1, q2, q3, dim * history + physical, element) -
+                  state(q1, q2, q3, dim * history_order + physical,
+                        element);
+               for (int reference = 0; reference < dim; ++reference)
+               {
+                  load += beta[history] * relative *
+                     gradient(q1, q2, q3, velocity, reference, element) *
+                     adjugate[reference][physical];
+               }
+            }
+         }
+         flux(q1, q2, q3, component, element) =
+            weight[q1 + q1d * (q2 + q1d * q3)] * load;
+      }
+   });
+
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALETensorProject3D<7, 8>(d1d, q1d, ne, vdim, maps, flux_, y_);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALETensorProject3D<3, 4>(d1d, q1d, ne, vdim, maps, flux_, y_);
+   }
+   else
+   {
+      PAALETensorProject3D<>(d1d, q1d, ne, vdim, maps, flux_, y_);
+   }
 }
 
 static void PAALEConvectionInteriorApply2D(
@@ -340,104 +494,179 @@ static void PAALEConvectionInteriorApply2D(
    });
 }
 
+template<int T_D1D = 0, int T_Q1D = 0>
+static void PAALEFaceEvaluate3D(
+   const int d1d, const int q1d, const int nf, const int vdim,
+   const DofToQuad &maps, const Vector &x_, Vector &state_)
+{
+   const int D1D = T_D1D ? T_D1D : d1d;
+   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   constexpr int max_D1D = T_D1D ? T_D1D : ALE_FACE_MAX_D1D;
+   constexpr int max_Q1D = T_Q1D ? T_Q1D : ALE_FACE_MAX_Q1D;
+   auto B = Reshape(maps.B.Read(), Q1D, D1D);
+   auto x = Reshape(x_.Read(), D1D, D1D, vdim, 2, nf);
+   auto state = Reshape(state_.Write(), Q1D, Q1D, vdim, 2, nf);
+   mfem::forall(nf * 2 * vdim, [=] MFEM_HOST_DEVICE(int index)
+   {
+      const int face = index / (2 * vdim);
+      const int side = (index / vdim) % 2;
+      const int field = index % vdim;
+      real_t x_projected[max_D1D][max_Q1D];
+      for (int d2 = 0; d2 < D1D; ++d2)
+      {
+         for (int q1 = 0; q1 < Q1D; ++q1)
+         {
+            real_t value = 0.0;
+            for (int d1 = 0; d1 < D1D; ++d1)
+            {
+               value += B(q1, d1) * x(d1, d2, field, side, face);
+            }
+            x_projected[d2][q1] = value;
+         }
+      }
+      for (int q2 = 0; q2 < Q1D; ++q2)
+      {
+         for (int q1 = 0; q1 < Q1D; ++q1)
+         {
+            real_t value = 0.0;
+            for (int d2 = 0; d2 < D1D; ++d2)
+            {
+               value += B(q2, d2) * x_projected[d2][q1];
+            }
+            state(q1, q2, field, side, face) = value;
+         }
+      }
+   });
+}
+
+template<int T_D1D = 0, int T_Q1D = 0>
+static void PAALEFaceProject3D(
+   const int d1d, const int q1d, const int nf, const int vdim,
+   const DofToQuad &maps, const Vector &flux_, Vector &y_)
+{
+   const int D1D = T_D1D ? T_D1D : d1d;
+   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   constexpr int max_D1D = T_D1D ? T_D1D : ALE_FACE_MAX_D1D;
+   constexpr int max_Q1D = T_Q1D ? T_Q1D : ALE_FACE_MAX_Q1D;
+   auto Bt = Reshape(maps.Bt.Read(), D1D, Q1D);
+   auto flux = Reshape(flux_.Read(), Q1D, Q1D, 3, 2, nf);
+   auto y = Reshape(y_.ReadWrite(), D1D, D1D, vdim, 2, nf);
+   mfem::forall(nf * 2 * 3, [=] MFEM_HOST_DEVICE(int index)
+   {
+      const int face = index / 6;
+      const int side = (index / 3) % 2;
+      const int component = index % 3;
+      real_t x_projected[max_D1D][max_Q1D];
+      for (int d2 = 0; d2 < D1D; ++d2)
+      {
+         for (int q1 = 0; q1 < Q1D; ++q1)
+         {
+            real_t value = 0.0;
+            for (int q2 = 0; q2 < Q1D; ++q2)
+            {
+               value += Bt(d2, q2) * flux(q1, q2, component, side, face);
+            }
+            x_projected[d2][q1] = value;
+         }
+      }
+      for (int d2 = 0; d2 < D1D; ++d2)
+      {
+         for (int d1 = 0; d1 < D1D; ++d1)
+         {
+            real_t value = 0.0;
+            for (int q1 = 0; q1 < Q1D; ++q1)
+            {
+               value += Bt(d1, q1) * x_projected[d2][q1];
+            }
+            y(d1, d2, component, side, face) += value;
+         }
+      }
+   });
+}
+
 static void PAALEConvectionInteriorApply3D(
    const int history_order, const real_t upwind, const int d1d,
    const int q1d, const int nf, const Array<real_t> &weights,
    const DofToQuad &maps, const Vector &determinants,
    const Vector &normals, const Vector &beta_weights,
-   const Vector &x_, Vector &y_)
+   const Vector &x_, Vector &state_, Vector &flux_, Vector &y_)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE interior PA face size exceeds the configured limit");
    const int dim = 3;
    const int vdim = dim * (history_order + 1);
-   auto B = Reshape(maps.B.Read(), q1d, d1d);
-   auto Bt = Reshape(maps.Bt.Read(), d1d, q1d);
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALEFaceEvaluate3D<7, 8>(d1d, q1d, nf, vdim, maps, x_, state_);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALEFaceEvaluate3D<3, 4>(d1d, q1d, nf, vdim, maps, x_, state_);
+   }
+   else
+   {
+      PAALEFaceEvaluate3D<>(d1d, q1d, nf, vdim, maps, x_, state_);
+   }
    auto det = Reshape(determinants.Read(), q1d, q1d, nf);
    auto normal = Reshape(normals.Read(), q1d, q1d, dim, nf);
    auto beta = beta_weights.Read();
    auto weight = weights.Read();
-   auto x = Reshape(x_.Read(), d1d, d1d, vdim, 2, nf);
-   auto y = Reshape(y_.ReadWrite(), d1d, d1d, vdim, 2, nf);
+   auto state = Reshape(state_.Read(), q1d, q1d, vdim, 2, nf);
+   auto flux = Reshape(flux_.Write(), q1d, q1d, dim, 2, nf);
 
-   mfem::forall(nf, [=] MFEM_HOST_DEVICE(int face)
+   mfem::forall(nf * q1d * q1d, [=] MFEM_HOST_DEVICE(int index)
    {
-      real_t flux[ALE_FACE_MAX_Q1D][ALE_FACE_MAX_Q1D][3][2];
-      for (int q2 = 0; q2 < q1d; ++q2)
+      const int face = index / (q1d * q1d);
+      const int q = index % (q1d * q1d);
+      const int q1 = q % q1d;
+      const int q2 = q / q1d;
+      for (int component = 0; component < dim; ++component)
       {
-         for (int q1 = 0; q1 < q1d; ++q1)
-         {
-            real_t state[12][2];
-            for (int component = 0; component < vdim; ++component)
-            {
-               state[component][0] = 0.0;
-               state[component][1] = 0.0;
-               for (int d2 = 0; d2 < d1d; ++d2)
-               {
-                  for (int d1 = 0; d1 < d1d; ++d1)
-                  {
-                     const real_t basis = B(q1, d1) * B(q2, d2);
-                     state[component][0] +=
-                        basis * x(d1, d2, component, 0, face);
-                     state[component][1] +=
-                        basis * x(d1, d2, component, 1, face);
-                  }
-               }
-            }
-            for (int component = 0; component < dim; ++component)
-            {
-               flux[q1][q2][component][0] = 0.0;
-               flux[q1][q2][component][1] = 0.0;
-            }
-            for (int history = 0; history < history_order; ++history)
-            {
-               real_t speed = 0.0;
-               for (int component = 0; component < dim; ++component)
-               {
-                  const int velocity = dim * history + component;
-                  const int grid = dim * history_order + component;
-                  speed += 0.5 * (state[velocity][0] + state[velocity][1] -
-                                  state[grid][0] - state[grid][1]) *
-                           normal(q1, q2, component, face);
-               }
-               const real_t dissipation = upwind * fabs(speed);
-               const real_t first = 0.5 * (-speed + dissipation);
-               const real_t second = 0.5 * (-speed - dissipation);
-               const real_t scale =
-                  weight[q1 + q2 * q1d] * det(q1, q2, face) * beta[history];
-               for (int component = 0; component < dim; ++component)
-               {
-                  const int velocity = dim * history + component;
-                  const real_t jump = state[velocity][0] - state[velocity][1];
-                  flux[q1][q2][component][0] += scale * first * jump;
-                  flux[q1][q2][component][1] += scale * second * jump;
-               }
-            }
-         }
+         flux(q1, q2, component, 0, face) = 0.0;
+         flux(q1, q2, component, 1, face) = 0.0;
       }
-      for (int d2 = 0; d2 < d1d; ++d2)
+      for (int history = 0; history < history_order; ++history)
       {
-         for (int d1 = 0; d1 < d1d; ++d1)
+         real_t speed = 0.0;
+         for (int component = 0; component < dim; ++component)
          {
-            for (int component = 0; component < dim; ++component)
-            {
-               real_t first = 0.0;
-               real_t second = 0.0;
-               for (int q2 = 0; q2 < q1d; ++q2)
-               {
-                  for (int q1 = 0; q1 < q1d; ++q1)
-                  {
-                     const real_t basis = Bt(d1, q1) * Bt(d2, q2);
-                     first += basis * flux[q1][q2][component][0];
-                     second += basis * flux[q1][q2][component][1];
-                  }
-               }
-               y(d1, d2, component, 0, face) += first;
-               y(d1, d2, component, 1, face) += second;
-            }
+            const int velocity = dim * history + component;
+            const int grid = dim * history_order + component;
+            speed += 0.5 *
+                     (state(q1, q2, velocity, 0, face) +
+                      state(q1, q2, velocity, 1, face) -
+                      state(q1, q2, grid, 0, face) -
+                      state(q1, q2, grid, 1, face)) *
+                     normal(q1, q2, component, face);
+         }
+         const real_t dissipation = upwind * fabs(speed);
+         const real_t first = 0.5 * (-speed + dissipation);
+         const real_t second = 0.5 * (-speed - dissipation);
+         const real_t scale =
+            weight[q] * det(q1, q2, face) * beta[history];
+         for (int component = 0; component < dim; ++component)
+         {
+            const int velocity = dim * history + component;
+            const real_t jump = state(q1, q2, velocity, 0, face) -
+                                state(q1, q2, velocity, 1, face);
+            flux(q1, q2, component, 0, face) += scale * first * jump;
+            flux(q1, q2, component, 1, face) += scale * second * jump;
          }
       }
    });
+
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALEFaceProject3D<7, 8>(d1d, q1d, nf, vdim, maps, flux_, y_);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALEFaceProject3D<3, 4>(d1d, q1d, nf, vdim, maps, flux_, y_);
+   }
+   else
+   {
+      PAALEFaceProject3D<>(d1d, q1d, nf, vdim, maps, flux_, y_);
+   }
 }
 
 static void PAALEConvectionBoundaryApply2D(
@@ -522,91 +751,80 @@ static void PAALEConvectionBoundaryApply3D(
    const Array<real_t> &weights, const DofToQuad &maps,
    const Vector &determinants, const Vector &normals,
    const Vector &datum_values, const Vector &beta_weights,
-   const Vector &x_, Vector &y_)
+   const Vector &x_, Vector &state_, Vector &flux_, Vector &y_)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE boundary PA face size exceeds the configured limit");
    const int dim = 3;
    const int vdim = dim * (history_order + 1 + (continuity_scratch ? 1 : 0));
-   auto B = Reshape(maps.B.Read(), q1d, d1d);
-   auto Bt = Reshape(maps.Bt.Read(), d1d, q1d);
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALEFaceEvaluate3D<7, 8>(d1d, q1d, nf, vdim, maps, x_, state_);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALEFaceEvaluate3D<3, 4>(d1d, q1d, nf, vdim, maps, x_, state_);
+   }
+   else
+   {
+      PAALEFaceEvaluate3D<>(d1d, q1d, nf, vdim, maps, x_, state_);
+   }
    auto det = Reshape(determinants.Read(), q1d, q1d, nf);
    auto normal = Reshape(normals.Read(), q1d, q1d, dim, nf);
    const bool constant_datum = datum_values.Size() == dim;
    auto datum = datum_values.Read();
    auto beta = beta_weights.Read();
    auto weight = weights.Read();
-   auto x = Reshape(x_.Read(), d1d, d1d, vdim, 2, nf);
-   auto y = Reshape(y_.ReadWrite(), d1d, d1d, vdim, 2, nf);
+   auto state = Reshape(state_.Read(), q1d, q1d, vdim, 2, nf);
+   auto flux = Reshape(flux_.Write(), q1d, q1d, dim, 2, nf);
 
-   mfem::forall(nf, [=] MFEM_HOST_DEVICE(int face)
+   mfem::forall(nf * q1d * q1d, [=] MFEM_HOST_DEVICE(int index)
    {
-      real_t flux[ALE_FACE_MAX_Q1D][ALE_FACE_MAX_Q1D][3];
-      for (int q2 = 0; q2 < q1d; ++q2)
+      const int face = index / (q1d * q1d);
+      const int q = index % (q1d * q1d);
+      const int q1 = q % q1d;
+      const int q2 = q / q1d;
+      real_t speed = 0.0;
+      for (int component = 0; component < dim; ++component)
       {
-         for (int q1 = 0; q1 < q1d; ++q1)
-         {
-            real_t state[15];
-            for (int component = 0; component < vdim; ++component)
-            {
-               state[component] = 0.0;
-               for (int d2 = 0; d2 < d1d; ++d2)
-               {
-                  for (int d1 = 0; d1 < d1d; ++d1)
-                  {
-                     state[component] += B(q1, d1) * B(q2, d2) *
-                        x(d1, d2, component, 0, face);
-                  }
-               }
-            }
-            real_t speed = 0.0;
-            for (int component = 0; component < dim; ++component)
-            {
-               const int grid = dim * history_order + component;
-               const int point = q1 + q1d * (q2 + q1d * face);
-               const real_t prescribed = constant_datum ? datum[component] :
-                  datum[component + dim * point];
-               speed += (prescribed - state[grid]) *
-                        normal(q1, q2, component, face);
-            }
-            const real_t coefficient = upwind * fabs(speed) - speed;
-            const real_t scale = weight[q1 + q2 * q1d] *
-                                 det(q1, q2, face) * coefficient;
-            for (int component = 0; component < dim; ++component)
-            {
-               real_t correction = 0.0;
-               for (int history = 0; history < history_order; ++history)
-               {
-                  const int point = q1 + q1d * (q2 + q1d * face);
-                  const real_t prescribed = constant_datum ? datum[component] :
-                     datum[component + dim * point];
-                  correction += beta[history] *
-                     (state[dim * history + component] - prescribed);
-               }
-               flux[q1][q2][component] = scale * correction;
-            }
-         }
+         const int grid = dim * history_order + component;
+         const int point = q1 + q1d * (q2 + q1d * face);
+         const real_t prescribed = constant_datum ? datum[component] :
+            datum[component + dim * point];
+         speed += (prescribed - state(q1, q2, grid, 0, face)) *
+                  normal(q1, q2, component, face);
       }
-      for (int d2 = 0; d2 < d1d; ++d2)
+      const real_t coefficient = upwind * fabs(speed) - speed;
+      const real_t scale = weight[q] * det(q1, q2, face) * coefficient;
+      for (int component = 0; component < dim; ++component)
       {
-         for (int d1 = 0; d1 < d1d; ++d1)
+         real_t correction = 0.0;
+         for (int history = 0; history < history_order; ++history)
          {
-            for (int component = 0; component < dim; ++component)
-            {
-               real_t load = 0.0;
-               for (int q2 = 0; q2 < q1d; ++q2)
-               {
-                  for (int q1 = 0; q1 < q1d; ++q1)
-                  {
-                     load += Bt(d1, q1) * Bt(d2, q2) *
-                             flux[q1][q2][component];
-                  }
-               }
-               y(d1, d2, component, 0, face) += load;
-            }
+            const int point = q1 + q1d * (q2 + q1d * face);
+            const real_t prescribed = constant_datum ? datum[component] :
+               datum[component + dim * point];
+            correction += beta[history] *
+               (state(q1, q2, dim * history + component, 0, face) -
+                prescribed);
          }
+         flux(q1, q2, component, 0, face) = scale * correction;
+         flux(q1, q2, component, 1, face) = 0.0;
       }
    });
+
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALEFaceProject3D<7, 8>(d1d, q1d, nf, vdim, maps, flux_, y_);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALEFaceProject3D<3, 4>(d1d, q1d, nf, vdim, maps, flux_, y_);
+   }
+   else
+   {
+      PAALEFaceProject3D<>(d1d, q1d, nf, vdim, maps, flux_, y_);
+   }
 }
 
 static void PAALEPressureBoundaryApply2D(
@@ -947,6 +1165,10 @@ void ALEConvectionVolumeIntegrator::AssemblePA(
    MFEM_VERIFY(nq == (dim == 2 ? quad1D * quad1D :
                      quad1D * quad1D * quad1D),
                "ALE volume PA requires a tensor-product integration rule");
+   const int vdim = dim * (history_order + 1);
+   pa_state.SetSize(nq * vdim * ne, memory);
+   pa_gradient.SetSize(nq * dim * history_order * dim * ne, memory);
+   pa_flux.SetSize(nq * dim * ne, memory);
 }
 
 void ALEConvectionVolumeIntegrator::AddMultPA(
@@ -968,7 +1190,7 @@ void ALEConvectionVolumeIntegrator::AddMultPA(
    {
       PAALEConvectionVolumeApply3D(
          history_order, dofs1D, quad1D, ne, ir.GetWeights(), *maps,
-         geom->J, *beta, x, y);
+         geom->J, *beta, x, pa_state, pa_gradient, pa_flux, y);
    }
 }
 
@@ -1136,6 +1358,10 @@ void ALEConvectionInteriorIntegrator::AssemblePAInteriorFaces(
    quad1D = maps->nqpt;
    MFEM_VERIFY(ir->GetNPoints() == (dim == 2 ? quad1D : quad1D * quad1D),
                "ALE interior PA requires a tensor-product face rule");
+   const int face_nq = ir->GetNPoints();
+   const int vdim = dim * (history_order + 1);
+   pa_state.SetSize(face_nq * vdim * 2 * nf, memory);
+   pa_flux.SetSize(face_nq * dim * 2 * nf, memory);
 }
 
 void ALEConvectionInteriorIntegrator::AddMultPA(
@@ -1157,7 +1383,7 @@ void ALEConvectionInteriorIntegrator::AddMultPA(
    {
       PAALEConvectionInteriorApply3D(
          history_order, upwind, dofs1D, quad1D, nf, ir.GetWeights(),
-         *maps, geom->detJ, geom->normal, *beta, x, y);
+         *maps, geom->detJ, geom->normal, *beta, x, pa_state, pa_flux, y);
    }
 }
 
@@ -1362,6 +1588,8 @@ void ALEConvectionBoundaryIntegrator::AssemblePABoundaryFaces(
 
    if (include_convection)
    {
+      pa_state.SetSize(nq * expected_vdim * 2 * nf, memory);
+      pa_flux.SetSize(nq * dim * 2 * nf, memory);
       CoefficientVector sampled_datum(
          *datum, quadrature, CoefficientStorage::COMPRESSED);
       pa_datum.SetSize(sampled_datum.Size(), memory);
@@ -1458,7 +1686,8 @@ void ALEConvectionBoundaryIntegrator::AddMultPA(
       PAALEConvectionBoundaryApply3D(
          history_order, include_continuity_scratch, upwind,
          dofs1D, quad1D, nf, ir.GetWeights(), *maps,
-         geom->detJ, geom->normal, pa_datum, *beta, x, y);
+         geom->detJ, geom->normal, pa_datum, *beta, x,
+         pa_state, pa_flux, y);
    }
 }
 

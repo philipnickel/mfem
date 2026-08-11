@@ -194,6 +194,9 @@ private:
    int quad1D = 0;
    const DofToQuad *maps = nullptr;
    const GeometricFactors *geom = nullptr;
+   mutable Vector pa_state;
+   mutable Vector pa_gradient;
+   mutable Vector pa_flux;
 
    Vector shape;
    DenseMatrix dshape;
@@ -255,6 +258,8 @@ private:
    int element_dofs = 0;
    const DofToQuad *maps = nullptr;
    const FaceGeometricFactors *geom = nullptr;
+   mutable Vector pa_state;
+   mutable Vector pa_flux;
    Vector pa_datum;
    Array<int> pa_boundary_elements;
    Vector pa_basis;
@@ -327,6 +332,8 @@ private:
    int quad1D = 0;
    const DofToQuad *maps = nullptr;
    const FaceGeometricFactors *geom = nullptr;
+   mutable Vector pa_state;
+   mutable Vector pa_flux;
 
    Vector shape1, shape2, normal;
 
