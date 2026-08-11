@@ -61,9 +61,9 @@ public:
 
    virtual void AssemblePABoundary(const FiniteElementSpace &fes);
 
-   virtual void AssemblePAInteriorFaces(const FiniteElementSpace &fes);
+   void AssemblePAInteriorFaces(const FiniteElementSpace &fes) override;
 
-   virtual void AssemblePABoundaryFaces(const FiniteElementSpace &fes);
+   void AssemblePABoundaryFaces(const FiniteElementSpace &fes) override;
 
    /// Assemble diagonal and add it to Vector @a diag.
    virtual void AssembleDiagonalPA(Vector &diag);
@@ -3076,9 +3076,9 @@ protected:
 
 /** @brief Integrator for
     $\left(\tau \nabla \cdot u, \nabla \cdot v\right)$ where @a u and @a v
-    are two-component fields formed from copies of a scalar L2 space.
+    have one component per mesh dimension, formed from a scalar L2 space.
 
-    This integrator currently supports partial assembly on two-dimensional,
+    This integrator supports partial assembly on two- and three-dimensional,
     uniform-order tensor-product L2 spaces with Ordering::byNODES. The
     coefficient is one nonnegative constant per local element. It is copied
     into the integrator; after changing it with SetElementCoefficient(), the
@@ -3088,8 +3088,9 @@ class VectorDivDivIntegrator : public BilinearFormIntegrator
 private:
    Vector element_coefficient;
    Vector pa_data;
+   mutable Vector quadrature_divergence;
    const DofToQuad *maps = nullptr; ///< Not owned.
-   int ne = 0, dofs1D = 0, quad1D = 0;
+   int dim = 0, ne = 0, dofs1D = 0, quad1D = 0;
 
 public:
    VectorDivDivIntegrator() = default;

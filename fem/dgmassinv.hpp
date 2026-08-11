@@ -147,6 +147,164 @@ public:
    void SetOperator(const Operator &) override { }
 };
 
+/** @brief Element-local L2 load for the vorticity of an equal-order vector
+    field.
+
+    The input is a byNODES vector made from @a dim copies of one scalar broken
+    space. In 2D the output is the scalar curl; in 3D it is the three-component
+    curl. Applying DGMassInverse completes the local L2 projection. */
+class LocalVorticityProjectionOperator : public Operator
+{
+private:
+   FiniteElementSpace &fes;
+   const IntegrationRule &ir;
+   const ElementRestrictionOperator *element_restriction = nullptr; ///< Not owned.
+   const QuadratureInterpolator *quadrature_interpolator = nullptr; ///< Not owned.
+   const DofToQuad *maps = nullptr; ///< Not owned.
+   int dim, curl_dim, scalar_size, ne, nd, nq, nd1d, nq1d;
+   mutable Vector element_values, quadrature_derivatives;
+   mutable Vector quadrature_curl, element_load;
+
+public:
+   LocalVorticityProjectionOperator(FiniteElementSpace &fes_,
+                                    const IntegrationRule &ir_);
+   void Mult(const Vector &x, Vector &y) const override;
+};
+
+/** @brief Boundary load for minus viscosity times normal curl of a projected
+    vorticity field on selected physical boundary attributes. */
+class CurlVorticityBoundaryIntegrator : public Operator
+{
+private:
+   FiniteElementSpace &fes;
+   Array<int> marker;
+   const IntegrationRule &ir;
+   const FaceRestriction *face_restriction = nullptr; ///< Not owned.
+   const FaceQuadratureInterpolator *face_interpolator = nullptr; ///< Not owned.
+   const DofToQuad *maps = nullptr; ///< Not owned.
+   Array<int> active_boundary;
+   int dim, curl_dim, scalar_size, nf, nq, face_dofs, nd1d, nq1d;
+   mutable Vector face_values, face_derivatives, quadrature_load, face_load;
+   real_t viscosity = 1.0;
+
+public:
+   CurlVorticityBoundaryIntegrator(FiniteElementSpace &fes_,
+                                   const Array<int> &marker_,
+                                   const IntegrationRule &ir_);
+   void SetViscosity(real_t viscosity_);
+   real_t GetViscosity() const { return viscosity; }
+   void Mult(const Vector &x, Vector &y) const override;
+};
+
+/** @brief Per-element magnitude of the volume mean of an equal-order vector
+    field.
+
+    The input contains @a dim scalar L-vectors in byNODES ordering. Mult()
+    returns one mean magnitude per local element and refreshes the matching
+    physical element volumes. */
+class ElementMeanMagnitudeOperator : public Operator
+{
+private:
+   FiniteElementSpace &fes;
+   const IntegrationRule &ir;
+   const ElementRestrictionOperator *element_restriction = nullptr; ///< Not owned.
+   const QuadratureInterpolator *quadrature_interpolator = nullptr; ///< Not owned.
+   int dim, scalar_size, ne, nd, nq;
+   mutable Vector element_values, quadrature_values, volumes;
+
+public:
+   ElementMeanMagnitudeOperator(FiniteElementSpace &fes_,
+                                const IntegrationRule &ir_);
+   void Mult(const Vector &x, Vector &y) const override;
+   /** Compute @a scale times the most recently evaluated mean magnitude
+       times the square root of the physical element volume. */
+   void ComputeTau(const Vector &mean, real_t scale, Vector &tau) const;
+   const Vector &GetElementVolumes() const { return volumes; }
+};
+
+/** @brief Native one-dimensional free-surface kinematic operator.
+
+    The packed input contains elevation, horizontal velocity, and vertical
+    velocity in three scalar byNODES blocks. The output is
+    M^{-1}(M u_y - (u_x d_x eta,phi) + F_LF), with a local
+    Lax--Friedrichs correction on every interior trace junction. */
+class SurfaceKinematicOperator : public Operator
+{
+private:
+   FiniteElementSpace &fes;
+   const IntegrationRule &ir;
+   const ElementRestrictionOperator *element_restriction = nullptr; ///< Not owned.
+   const QuadratureInterpolator *quadrature_interpolator = nullptr; ///< Not owned.
+   const FaceRestriction *face_restriction = nullptr; ///< Not owned.
+   const DofToQuad *maps = nullptr; ///< Not owned.
+   int scalar_size, ne, nd, nq, nd1d, nq1d;
+   real_t upwind_factor;
+   Vector inverse_mass, orientation, orientation_face;
+   mutable Vector eta_face, velocity_face, face_flux, volume_flux, load;
+   mutable Vector element_values, eta_derivatives, velocity_values;
+   mutable Vector quadrature_load, element_load, element_rate;
+   mutable Vector packed_input;
+
+public:
+   SurfaceKinematicOperator(FiniteElementSpace &fes_,
+                            const IntegrationRule &ir_,
+                            real_t upwind_factor_ = 1.0);
+   void SetUpwindFactor(real_t value);
+   real_t GetUpwindFactor() const { return upwind_factor; }
+   void Mult(const Vector &x, Vector &y) const override;
+   /// Apply from three native scalar blocks without constructing device-unsafe aliases.
+   void Mult3(const Vector &elevation, const Vector &velocity_x,
+              const Vector &velocity_y, Vector &rate) const;
+};
+
+/** @brief Native kinematic operator on a two-dimensional quadrilateral
+    free-surface submesh embedded in three-dimensional space.
+
+    The packed input contains elevation, the two horizontal velocity
+    components, and vertical velocity in four scalar byNODES blocks. The
+    output is
+
+        M^{-1}(M u_z - (u_x d_x eta + u_y d_y eta, phi) + F_LF),
+
+    where @a F_LF is the strong-form local Lax--Friedrichs correction on every
+    interior or periodic surface edge. Physical boundary edges use the graph
+    wall condition (zero normal transport), for which the correction is zero.
+    The surface geometry is captured at construction and remains the flat
+    reference manifold while the parent volume mesh moves. */
+class SurfaceKinematicOperator2D : public Operator
+{
+private:
+   FiniteElementSpace &fes;
+   const IntegrationRule &ir;
+   const IntegrationRule *face_ir = nullptr; ///< Not owned (global rule table).
+   const ElementRestrictionOperator *element_restriction = nullptr; ///< Not owned.
+   const FaceRestriction *face_restriction = nullptr; ///< Not owned.
+   const QuadratureInterpolator *quadrature_interpolator = nullptr; ///< Not owned.
+   const DofToQuad *maps = nullptr; ///< Not owned.
+   const DofToQuad *face_maps = nullptr; ///< Not owned.
+   int scalar_size, ne, nd, nq, nd1d, nq1d;
+   int nf, face_nd, face_nq, sdim;
+   real_t upwind_factor;
+   Vector inverse_mass, volume_weights, gradient_map;
+   Vector face_weights, face_normals;
+   mutable Vector element_values, eta_derivatives, velocity_values;
+   mutable Vector quadrature_load, element_load, element_rate;
+   mutable Vector face_element_values, face_values;
+   mutable Vector face_quadrature_flux, face_element_flux;
+   mutable Vector volume_flux, load, packed_input;
+
+public:
+   SurfaceKinematicOperator2D(FiniteElementSpace &fes_,
+                              const IntegrationRule &ir_,
+                              real_t upwind_factor_ = 1.0);
+   void SetUpwindFactor(real_t value);
+   real_t GetUpwindFactor() const { return upwind_factor; }
+   void Mult(const Vector &x, Vector &y) const override;
+   void Mult4(const Vector &elevation, const Vector &velocity_x,
+              const Vector &velocity_y, const Vector &velocity_z,
+              Vector &rate) const;
+};
+
 } // namespace mfem
 
 #endif

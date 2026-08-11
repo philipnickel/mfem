@@ -14,6 +14,10 @@
 
 #include "nonlinearform.hpp"
 #include "ceed/interface/util.hpp"
+#include "../general/forall.hpp"
+#ifdef MFEM_USE_MPI
+#include "pgridfunc.hpp"
+#endif
 
 namespace mfem
 {
@@ -25,17 +29,25 @@ PANonlinearFormExtension::PANonlinearFormExtension(const NonlinearForm *nlf):
    NonlinearFormExtension(nlf),
    fes(*nlf->FESpace()),
    dnfi(*nlf->GetDNFI()),
+   fnfi(nlf->GetInteriorFaceIntegrators()),
+   bfnfi(nlf->GetBdrFaceIntegrators()),
+   bfnfi_marker(nlf->GetBdrFaceIntegratorMarkers()),
    elemR(nullptr),
+   int_face_restriction(nullptr),
+   bdr_face_restriction(nullptr),
+   bdr_face_attributes(nullptr),
    Grad(*this)
 {
-   if (!DeviceCanUseCeed())
-   {
-      elemR = fes.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
-      // TODO: optimize for the case when 'elemR' is identity
-      xe.SetSize(elemR->Height(), Device::GetMemoryType());
-      ye.SetSize(elemR->Height(), Device::GetMemoryType());
-   }
+   elemR = fes.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
+   // Face kernels can require adjacent full-element data even when a CEED
+   // backend owns the domain action, so retain this native restriction in all
+   // backend configurations.
+   xe.SetSize(elemR->Height(), Device::GetMemoryType());
+   ye.SetSize(elemR->Height(), Device::GetMemoryType());
    ye.UseDevice(true);
+   int_face_y.UseDevice(true);
+   bdr_face_y.UseDevice(true);
+   bdr_face_work.UseDevice(true);
 }
 
 real_t PANonlinearFormExtension::GetGridFunctionEnergy(const Vector &x) const
@@ -52,11 +64,36 @@ real_t PANonlinearFormExtension::GetGridFunctionEnergy(const Vector &x) const
 
 void PANonlinearFormExtension::Assemble()
 {
-   MFEM_VERIFY(nlf->GetInteriorFaceIntegrators().Size() == 0 &&
-               nlf->GetBdrFaceIntegrators().Size() == 0,
-               "face integrators are not supported yet");
-
    for (int i = 0; i < dnfi.Size(); ++i) { dnfi[i]->AssemblePA(fes); }
+
+   if (fnfi.Size())
+   {
+      int_face_restriction = fes.GetFaceRestriction(
+                                ElementDofOrdering::LEXICOGRAPHIC,
+                                FaceType::Interior);
+      int_face_x.SetSize(int_face_restriction->Height(), Device::GetMemoryType());
+      int_face_y.SetSize(int_face_restriction->Height(), Device::GetMemoryType());
+      for (int i = 0; i < fnfi.Size(); ++i)
+      {
+         fnfi[i]->AssemblePAInteriorFaces(fes);
+      }
+   }
+
+   if (bfnfi.Size())
+   {
+      bdr_face_restriction = fes.GetFaceRestriction(
+                                ElementDofOrdering::LEXICOGRAPHIC,
+                                FaceType::Boundary,
+                                L2FaceValues::DoubleValued);
+      bdr_face_x.SetSize(bdr_face_restriction->Height(), Device::GetMemoryType());
+      bdr_face_y.SetSize(bdr_face_restriction->Height(), Device::GetMemoryType());
+      bdr_face_work.SetSize(bdr_face_restriction->Height(), Device::GetMemoryType());
+      bdr_face_attributes = &fes.GetMesh()->GetBdrFaceAttributes();
+      for (int i = 0; i < bfnfi.Size(); ++i)
+      {
+         bfnfi[i]->AssemblePABoundaryFaces(fes);
+      }
+   }
 }
 
 void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
@@ -77,6 +114,66 @@ void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
          dnfi[i]->AddMultPA(x, y);
       }
    }
+
+   if (int_face_restriction && fnfi.Size())
+   {
+      elemR->Mult(x, xe);
+      const Vector *face_source = &x;
+#ifdef MFEM_USE_MPI
+      ParGridFunction parallel_source;
+      if (auto *parallel_fes = dynamic_cast<ParFiniteElementSpace*>(
+                                  const_cast<FiniteElementSpace*>(&fes)))
+      {
+         parallel_source.MakeRef(parallel_fes, const_cast<Vector&>(x), 0);
+         face_source = &parallel_source;
+      }
+#endif
+      int_face_restriction->Mult(*face_source, int_face_x);
+      int_face_y = 0.0;
+      for (int i = 0; i < fnfi.Size(); ++i)
+      {
+         fnfi[i]->AddMultPAFace(int_face_x, xe, int_face_y);
+      }
+      int_face_restriction->AddMultTransposeInPlace(int_face_y, y);
+   }
+
+   if (bdr_face_restriction && bfnfi.Size())
+   {
+      elemR->Mult(x, xe);
+      bdr_face_restriction->Mult(x, bdr_face_x);
+      bdr_face_y = 0.0;
+      const int faces = bdr_face_attributes->Size();
+      const int face_dofs = faces ? bdr_face_y.Size() / faces : 0;
+      for (int i = 0; i < bfnfi.Size(); ++i)
+      {
+         const Array<int> *marker = bfnfi_marker[i];
+         if (!marker)
+         {
+            bfnfi[i]->AddMultPAFace(bdr_face_x, xe, bdr_face_y);
+            continue;
+         }
+         bdr_face_work = 0.0;
+         bfnfi[i]->AddMultPAFace(bdr_face_x, xe, bdr_face_work);
+         const auto attributes = bdr_face_attributes->Read();
+         const auto enabled = marker->Read();
+         const int marker_size = marker->Size();
+         auto work = bdr_face_work.ReadWrite();
+         mfem::forall(faces, [=] MFEM_HOST_DEVICE(int face)
+         {
+            const int attribute = attributes[face];
+            if (attribute <= 0 || attribute > marker_size ||
+                enabled[attribute - 1] == 0)
+            {
+               for (int dof = 0; dof < face_dofs; ++dof)
+               {
+                  work[face * face_dofs + dof] = 0.0;
+               }
+            }
+         });
+         bdr_face_y += bdr_face_work;
+      }
+      bdr_face_restriction->AddMultTransposeInPlace(bdr_face_y, y);
+   }
 }
 
 Operator &PANonlinearFormExtension::GetGradient(const Vector &x) const
@@ -89,8 +186,16 @@ void PANonlinearFormExtension::Update()
 {
    height = width = fes.GetVSize();
    elemR = fes.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
+   int_face_restriction = nullptr;
+   bdr_face_restriction = nullptr;
+   bdr_face_attributes = nullptr;
    xe.SetSize(elemR->Height());
    ye.SetSize(elemR->Height());
+   int_face_x.SetSize(0);
+   int_face_y.SetSize(0);
+   bdr_face_x.SetSize(0);
+   bdr_face_y.SetSize(0);
+   bdr_face_work.SetSize(0);
    Grad.Update();
 }
 

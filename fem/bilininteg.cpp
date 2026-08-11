@@ -3198,6 +3198,344 @@ void VectorDiffusionIntegrator::AssembleElementVector(
    }
 }
 
+LocalVorticityProjectionOperator::LocalVorticityProjectionOperator(
+   FiniteElementSpace &fes_, const IntegrationRule &ir_)
+   : Operator((fes_.GetMesh()->Dimension() == 2 ? 1 : 3) * fes_.GetVSize(),
+              fes_.GetMesh()->Dimension() * fes_.GetVSize()),
+     fes(fes_), ir(ir_), dim(fes_.GetMesh()->Dimension()),
+     curl_dim(dim == 2 ? 1 : 3), scalar_size(fes_.GetVSize()),
+     ne(fes_.GetNE()), nd(fes_.GetTypicalFE()->GetDof()),
+     nq(ir_.GetNPoints())
+{
+   MFEM_VERIFY(dim == 2 || dim == 3,
+               "local vorticity projection supports 2D and 3D meshes");
+   MFEM_VERIFY(fes.GetVDim() == 1,
+               "local vorticity projection requires a scalar base space");
+   MFEM_VERIFY(fes.GetVSize() == fes.GetTrueVSize(),
+               "local vorticity projection requires a broken scalar space");
+   element_restriction = fes.GetElementRestriction(
+                            ElementDofOrdering::LEXICOGRAPHIC);
+   quadrature_interpolator = fes.GetQuadratureInterpolator(ir);
+   maps = &fes.GetTypicalFE()->GetDofToQuad(ir, DofToQuad::TENSOR);
+   nd1d = maps->ndof;
+   nq1d = maps->nqpt;
+   MFEM_VERIFY(element_restriction != nullptr &&
+               element_restriction->Height() == ne * nd,
+               "vorticity projection requires a tensor element restriction");
+   MFEM_VERIFY(quadrature_interpolator != nullptr &&
+               (dim == 2 ? nd1d*nd1d : nd1d*nd1d*nd1d) == nd &&
+               (dim == 2 ? nq1d*nq1d : nq1d*nq1d*nq1d) == nq,
+               "vorticity projection requires tensor-product elements and rule");
+   quadrature_interpolator->EnableTensorProducts();
+   quadrature_interpolator->SetOutputLayout(QVectorLayout::byNODES);
+   element_values.SetSize(2 * ne * nd);
+   quadrature_derivatives.SetSize(dim * dim * ne * nq);
+   quadrature_curl.SetSize(curl_dim * ne * nq);
+   element_load.SetSize(curl_dim * ne * nd);
+   element_values.UseDevice(true);
+   quadrature_derivatives.UseDevice(true);
+   quadrature_curl.UseDevice(true);
+   element_load.UseDevice(true);
+}
+
+void LocalVorticityProjectionOperator::Mult(const Vector &x, Vector &y) const
+{
+   MFEM_VERIFY(x.Size() == Width(), "vorticity input has the wrong size");
+   y.SetSize(Height());
+   y.UseDevice(true);
+   y = 0.0;
+
+   for (int c = 0; c < dim; ++c)
+   {
+      Vector component, restricted_component, q_component;
+      component.MakeRef(element_values, 0, ne * nd);
+      restricted_component.MakeRef(element_values, ne * nd, ne * nd);
+      q_component.MakeRef(quadrature_derivatives,
+                          c * dim * ne * nq, dim * ne * nq);
+      const real_t *X = x.Read();
+      real_t *C = component.Write();
+      const int offset = c * scalar_size;
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         C[i] = X[offset + i];
+      });
+      element_restriction->Mult(component, restricted_component);
+      quadrature_interpolator->PhysDerivatives(
+         restricted_component, q_component);
+   }
+
+   const GeometricFactors *geom = fes.GetMesh()->GetGeometricFactors(
+                                     ir, GeometricFactors::DETERMINANTS);
+   MFEM_VERIFY(geom != nullptr && geom->detJ.Size() == ne * nq,
+               "vorticity geometry has the wrong size");
+   const real_t *W = ir.GetWeights().Read();
+   const real_t *J = geom->detJ.Read();
+   const real_t *D = quadrature_derivatives.Read();
+   real_t *C = quadrature_curl.Write();
+   const int nq_ne = nq * ne;
+   mfem::forall(ne * nq, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int q = i % nq;
+      const int e = i / nq;
+      const real_t weight = W[q] * fabs(J[q + nq * e]);
+      if (dim == 2)
+      {
+         const real_t duy_dx = D[q + nq*(0 + dim*e) + dim*nq_ne];
+         const real_t dux_dy = D[q + nq*(1 + dim*e)];
+         C[q + nq*e] = weight * (duy_dx - dux_dy);
+      }
+      else
+      {
+         const real_t duz_dy = D[q + nq*(1 + dim*e) + 2*dim*nq_ne];
+         const real_t duy_dz = D[q + nq*(2 + dim*e) + dim*nq_ne];
+         const real_t dux_dz = D[q + nq*(2 + dim*e)];
+         const real_t duz_dx = D[q + nq*(0 + dim*e) + 2*dim*nq_ne];
+         const real_t duy_dx = D[q + nq*(0 + dim*e) + dim*nq_ne];
+         const real_t dux_dy = D[q + nq*(1 + dim*e)];
+         C[q + nq*e] = weight * (duz_dy - duy_dz);
+         C[q + nq*e + nq_ne] = weight * (dux_dz - duz_dx);
+         C[q + nq*e + 2*nq_ne] = weight * (duy_dx - dux_dy);
+      }
+   });
+
+   const real_t *B = maps->B.Read();
+   const real_t *CQ = quadrature_curl.Read();
+   real_t *EL = element_load.Write();
+   mfem::forall(curl_dim * ne * nd, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d = i % nd;
+      const int e = (i / nd) % ne;
+      const int c = i / (nd * ne);
+      real_t value = 0.0;
+      if (dim == 2)
+      {
+         const int dx = d % nd1d;
+         const int dy = d / nd1d;
+         for (int qy = 0; qy < nq1d; ++qy)
+         {
+            for (int qx = 0; qx < nq1d; ++qx)
+            {
+               const int q = qx + nq1d*qy;
+               value += B[qx + nq1d*dx] * B[qy + nq1d*dy]
+                        * CQ[q + nq*e + c*nq_ne];
+            }
+         }
+      }
+      else
+      {
+         const int dx = d % nd1d;
+         const int dy = (d / nd1d) % nd1d;
+         const int dz = d / (nd1d*nd1d);
+         for (int qz = 0; qz < nq1d; ++qz)
+         {
+            for (int qy = 0; qy < nq1d; ++qy)
+            {
+               for (int qx = 0; qx < nq1d; ++qx)
+               {
+                  const int q = qx + nq1d*(qy + nq1d*qz);
+                  value += B[qx + nq1d*dx] * B[qy + nq1d*dy]
+                           * B[qz + nq1d*dz]
+                           * CQ[q + nq*e + c*nq_ne];
+               }
+            }
+         }
+      }
+      EL[d + nd*e + c*nd*ne] = value;
+   });
+
+   for (int c = 0; c < curl_dim; ++c)
+   {
+      Vector e_component, output_component;
+      e_component.MakeRef(element_load, c * ne * nd, ne * nd);
+      output_component.MakeRef(y, c * scalar_size, scalar_size);
+      element_restriction->MultTranspose(e_component, output_component);
+   }
+}
+
+CurlVorticityBoundaryIntegrator::CurlVorticityBoundaryIntegrator(
+   FiniteElementSpace &fes_, const Array<int> &marker_,
+   const IntegrationRule &ir_)
+   : Operator(fes_.GetVSize(),
+              (fes_.GetMesh()->Dimension() == 2 ? 1 : 3) * fes_.GetVSize()),
+     fes(fes_), marker(marker_), ir(ir_), dim(fes_.GetMesh()->Dimension()),
+     curl_dim(dim == 2 ? 1 : 3), scalar_size(fes_.GetVSize()),
+     nf(0), nq(ir_.GetNPoints()), face_dofs(0), nd1d(0), nq1d(0)
+{
+   MFEM_VERIFY(dim == 2 || dim == 3,
+               "curl-vorticity boundary load supports 2D and 3D meshes");
+   MFEM_VERIFY(fes.GetVDim() == 1,
+               "curl-vorticity boundary load requires a scalar base space");
+   MFEM_VERIFY(fes.GetVSize() == fes.GetTrueVSize(),
+               "curl-vorticity boundary load requires a broken scalar space");
+   Mesh &mesh = *fes.GetMesh();
+   FaceQuadratureSpace boundary_space(mesh, ir, FaceType::Boundary);
+   nf = boundary_space.GetNumFaces();
+   face_restriction = fes.GetFaceRestriction(
+                         ElementDofOrdering::LEXICOGRAPHIC,
+                         FaceType::Boundary, L2FaceValues::SingleValued);
+   face_interpolator = fes.GetFaceQuadratureInterpolator(ir, FaceType::Boundary);
+   const FiniteElement *trace = fes.GetTypicalTraceElement();
+   maps = &trace->GetDofToQuad(ir, DofToQuad::TENSOR);
+   face_dofs = trace->GetDof();
+   nd1d = maps->ndof;
+   nq1d = maps->nqpt;
+   MFEM_VERIFY(face_restriction != nullptr &&
+               face_restriction->Height() == nf * face_dofs &&
+               face_interpolator != nullptr &&
+               (dim == 2 ? nd1d : nd1d*nd1d) == face_dofs &&
+               (dim == 2 ? nq1d : nq1d*nq1d) == nq,
+               "curl-vorticity boundary load requires tensor-product faces");
+   face_interpolator->SetOutputLayout(QVectorLayout::byNODES);
+
+   Array<int> face_attribute(mesh.GetNumFaces());
+   face_attribute = 0;
+   for (int be = 0; be < mesh.GetNBE(); ++be)
+   {
+      face_attribute[mesh.GetBdrElementFaceIndex(be)] = mesh.GetBdrAttribute(be);
+   }
+   active_boundary.SetSize(nf);
+   for (int f = 0; f < nf; ++f)
+   {
+      const int attribute = face_attribute[boundary_space.GetMeshFaceIndex(f)];
+      active_boundary[f] = attribute >= 1 && attribute <= marker.Size()
+                           && marker[attribute - 1] ? 1 : 0;
+   }
+   face_values.SetSize(curl_dim * face_restriction->Height());
+   face_derivatives.SetSize(curl_dim * (dim - 1) * nf * nq);
+   quadrature_load.SetSize(nf * nq);
+   face_load.SetSize(face_restriction->Height());
+   active_boundary.GetMemory().UseDevice(true);
+   face_values.UseDevice(true);
+   face_derivatives.UseDevice(true);
+   quadrature_load.UseDevice(true);
+   face_load.UseDevice(true);
+}
+
+void CurlVorticityBoundaryIntegrator::SetViscosity(real_t viscosity_)
+{
+   MFEM_VERIFY(viscosity_ >= 0.0 && std::isfinite(viscosity_),
+               "viscosity must be finite and non-negative");
+   viscosity = viscosity_;
+}
+
+void CurlVorticityBoundaryIntegrator::Mult(const Vector &x, Vector &y) const
+{
+   MFEM_VERIFY(x.Size() == Width(), "projected vorticity has the wrong size");
+   y.SetSize(Height());
+   y.UseDevice(true);
+   y = 0.0;
+   if (viscosity == 0.0 || nf == 0) { return; }
+
+   const int face_size = face_restriction->Height();
+   const int derivative_size = (dim - 1) * nf * nq;
+   for (int c = 0; c < curl_dim; ++c)
+   {
+      Vector component, face_component, derivative_component;
+      Vector empty_value, empty_det, empty_normal;
+      component.MakeRef(const_cast<Vector&>(x), c * scalar_size, scalar_size);
+      face_component.MakeRef(face_values, c * face_size, face_size);
+      derivative_component.MakeRef(face_derivatives,
+                                   c * derivative_size, derivative_size);
+      face_restriction->Mult(component, face_component);
+      face_interpolator->Mult(
+         face_component, FaceQuadratureInterpolator::DERIVATIVES,
+         empty_value, derivative_component, empty_det, empty_normal);
+   }
+
+   const FaceGeometricFactors *geom = fes.GetMesh()->GetFaceGeometricFactors(
+      ir, FaceGeometricFactors::JACOBIANS |
+      FaceGeometricFactors::NORMALS, FaceType::Boundary);
+   MFEM_VERIFY(geom != nullptr && geom->J.Size() == dim*(dim - 1)*nf*nq &&
+               geom->normal.Size() == dim*nf*nq,
+               "curl-vorticity boundary geometry has the wrong size");
+   const int *A = active_boundary.Read();
+   const real_t *D = face_derivatives.Read();
+   const real_t *J = geom->J.Read();
+   const real_t *N = geom->normal.Read();
+   const real_t *W = ir.GetWeights().Read();
+   real_t *Q = quadrature_load.Write();
+   const real_t nu = viscosity;
+   const int nq_nf = nq * nf;
+   mfem::forall(nf * nq, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int q = i % nq;
+      const int f = i / nq;
+      if (!A[f]) { Q[i] = 0.0; return; }
+      real_t normal_curl = 0.0;
+      if (dim == 2)
+      {
+         const real_t tx = J[q + nq*(0 + dim*f)];
+         const real_t ty = J[q + nq*(1 + dim*f)];
+         const real_t orientation = ty*N[q + nq*(0 + dim*f)]
+                                    - tx*N[q + nq*(1 + dim*f)];
+         const real_t sign = orientation < 0.0 ? -1.0 : 1.0;
+         normal_curl = sign * D[q + nq*f];
+      }
+      else
+      {
+         real_t a[3], b[3], normal[3];
+         for (int d = 0; d < 3; ++d)
+         {
+            a[d] = J[q + nq*(d + dim*(0 + (dim - 1)*f))];
+            b[d] = J[q + nq*(d + dim*(1 + (dim - 1)*f))];
+            normal[d] = N[q + nq*(d + dim*f)];
+         }
+         const real_t cross[3] =
+         {
+            a[1]*b[2] - a[2]*b[1],
+            a[2]*b[0] - a[0]*b[2],
+            a[0]*b[1] - a[1]*b[0]
+         };
+         const real_t orientation = cross[0]*normal[0] +
+                                    cross[1]*normal[1] +
+                                    cross[2]*normal[2];
+         const real_t sign = orientation < 0.0 ? -1.0 : 1.0;
+         for (int c = 0; c < 3; ++c)
+         {
+            const real_t du = D[q + nq*(0 + (dim - 1)*f)
+                                  + c*(dim - 1)*nq_nf];
+            const real_t dv = D[q + nq*(1 + (dim - 1)*f)
+                                  + c*(dim - 1)*nq_nf];
+            normal_curl += sign * (b[c]*du - a[c]*dv);
+         }
+      }
+      Q[i] = -nu * W[q] * normal_curl;
+   });
+
+   const real_t *B = maps->B.Read();
+   const real_t *QL = quadrature_load.Read();
+   real_t *FL = face_load.Write();
+   mfem::forall(nf * face_dofs, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d = i % face_dofs;
+      const int f = i / face_dofs;
+      real_t value = 0.0;
+      if (dim == 2)
+      {
+         for (int q = 0; q < nq1d; ++q)
+         {
+            value += B[q + nq1d*d] * QL[q + nq*f];
+         }
+      }
+      else
+      {
+         const int dx = d % nd1d;
+         const int dy = d / nd1d;
+         for (int qy = 0; qy < nq1d; ++qy)
+         {
+            for (int qx = 0; qx < nq1d; ++qx)
+            {
+               const int q = qx + nq1d*qy;
+               value += B[qx + nq1d*dx] * B[qy + nq1d*dy]
+                        * QL[q + nq*f];
+            }
+         }
+      }
+      FL[d + face_dofs*f] = value;
+   });
+   face_restriction->MultTranspose(face_load, y);
+}
+
 ElasticityComponentIntegrator::ElasticityComponentIntegrator(
    ElasticityIntegrator &parent_, int i_, int j_)
    : parent(parent_),

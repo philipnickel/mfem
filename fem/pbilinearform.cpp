@@ -14,10 +14,224 @@
 #ifdef MFEM_USE_MPI
 
 #include "fem.hpp"
+#include "../general/forall.hpp"
 #include "../general/sort_pairs.hpp"
 
 namespace mfem
 {
+
+SIPGeometryPenaltyOperator::SIPGeometryPenaltyOperator(
+   ParMesh &mesh_, int degree_, const IntegrationRule &face_ir_,
+   const IntegrationRule &element_ir_)
+   : mesh(mesh_), degree(degree_), face_ir(face_ir_), element_ir(element_ir_)
+{
+   MFEM_VERIFY(degree >= 0, "SIP degree must be non-negative");
+   FaceQuadratureSpace interior_space(mesh, face_ir, FaceType::Interior);
+   FaceQuadratureSpace boundary_space(mesh, face_ir, FaceType::Boundary);
+   interior_faces.SetSize(interior_space.GetNumFaces());
+   boundary_faces.SetSize(boundary_space.GetNumFaces());
+   interior_e1.SetSize(interior_faces.Size());
+   interior_e2.SetSize(interior_faces.Size());
+   boundary_e1.SetSize(boundary_faces.Size());
+   for (int i = 0; i < interior_faces.Size(); ++i)
+   {
+      interior_faces[i] = interior_space.GetMeshFaceIndex(i);
+      mesh.GetFaceElements(interior_faces[i], &interior_e1[i], &interior_e2[i]);
+      MFEM_VERIFY(interior_e1[i] >= 0 && interior_e1[i] < mesh.GetNE(),
+                  "interior SIP face has invalid local adjacency");
+   }
+   for (int i = 0; i < boundary_faces.Size(); ++i)
+   {
+      boundary_faces[i] = boundary_space.GetMeshFaceIndex(i);
+      int e2;
+      mesh.GetFaceElements(boundary_faces[i], &boundary_e1[i], &e2);
+      MFEM_VERIFY(boundary_e1[i] >= 0 && boundary_e1[i] < mesh.GetNE() && e2 < 0,
+                  "physical boundary SIP face has invalid adjacency");
+   }
+
+   p0_fec = std::make_unique<L2_FECollection>(
+               0, mesh.Dimension(), BasisType::GaussLobatto);
+   p0_fes = std::make_unique<ParFiniteElementSpace>(&mesh, p0_fec.get(), 1);
+   MFEM_VERIFY(p0_fes->GetVSize() == mesh.GetNE(),
+               "P0 SIP exchange space must have one dof per element");
+   if (interior_faces.Size() > 0)
+   {
+      face_restriction = p0_fes->GetFaceRestriction(
+                            ElementDofOrdering::NATIVE, FaceType::Interior);
+      MFEM_VERIFY(face_restriction != nullptr,
+                  "SIP geometry update requires an interior face restriction");
+      MFEM_VERIFY(face_restriction->Height() == 2 * interior_faces.Size(),
+                  "P0 face restriction ordering does not match interior faces");
+   }
+   local_p0.SetSize(p0_fes->GetVSize());
+   restricted_p0.SetSize(2 * interior_faces.Size());
+   element_penalties.SetSize(mesh.GetNE());
+   face_penalties.SetSize(mesh.GetNumFaces());
+   interior_quadrature_penalties.SetSize(
+      interior_faces.Size() * face_ir.GetNPoints());
+   boundary_quadrature_penalties.SetSize(
+      boundary_faces.Size() * face_ir.GetNPoints());
+   weighted_boundary.SetSize(mesh.GetNE());
+   local_p0.UseDevice(true);
+   restricted_p0.UseDevice(true);
+   element_penalties.UseDevice(true);
+   face_penalties.UseDevice(true);
+   interior_quadrature_penalties.UseDevice(true);
+   boundary_quadrature_penalties.UseDevice(true);
+   weighted_boundary.UseDevice(true);
+   Update();
+}
+
+void SIPGeometryPenaltyOperator::Update()
+{
+   const int ne = mesh.GetNE();
+   weighted_boundary = 0.0;
+   const MemoryType mt = Device::GetDeviceMemoryType();
+   const int nqf = face_ir.GetNPoints();
+   const real_t *Wf = face_ir.GetWeights().Read();
+   real_t *A = weighted_boundary.ReadWrite();
+   const int nif = interior_faces.Size();
+   const FaceGeometricFactors *interior_geom = nullptr;
+   const real_t *Ji = nullptr;
+   if (nif > 0)
+   {
+      interior_geom = mesh.GetFaceGeometricFactors(
+         face_ir, FaceGeometricFactors::DETERMINANTS, FaceType::Interior, mt);
+      MFEM_VERIFY(interior_geom != nullptr && interior_geom->detJ.Size() == nqf * nif,
+                  "interior SIP face geometry has the wrong size");
+      Ji = interior_geom->detJ.Read();
+   }
+   const int *E1 = interior_e1.Read();
+   const int *E2 = interior_e2.Read();
+   mfem::forall(nif, [=] MFEM_HOST_DEVICE(int i)
+   {
+      real_t measure = 0.0;
+      for (int q = 0; q < nqf; ++q)
+      {
+         measure += Wf[q] * Ji[q + nqf * i];
+      }
+      AtomicAdd(A[E1[i]], 0.5 * measure);
+      if (E2[i] >= 0 && E2[i] < ne)
+      {
+         AtomicAdd(A[E2[i]], 0.5 * measure);
+      }
+   });
+
+   const int nbf = boundary_faces.Size();
+   const FaceGeometricFactors *boundary_geom = mesh.GetFaceGeometricFactors(
+      face_ir, FaceGeometricFactors::DETERMINANTS, FaceType::Boundary, mt);
+   MFEM_VERIFY(boundary_geom != nullptr && boundary_geom->detJ.Size() == nqf * nbf,
+               "boundary SIP face geometry has the wrong size");
+   const real_t *Jb = boundary_geom->detJ.Read();
+   const int *BE1 = boundary_e1.Read();
+   mfem::forall(nbf, [=] MFEM_HOST_DEVICE(int i)
+   {
+      real_t measure = 0.0;
+      for (int q = 0; q < nqf; ++q)
+      {
+         measure += Wf[q] * Jb[q + nqf * i];
+      }
+      AtomicAdd(A[BE1[i]], measure);
+   });
+
+   const int nqe = element_ir.GetNPoints();
+   const GeometricFactors *element_geom = mesh.GetGeometricFactors(
+      element_ir, GeometricFactors::DETERMINANTS, mt);
+   const real_t *We = element_ir.GetWeights().Read();
+   const real_t *Je = element_geom->detJ.Read();
+   const real_t degree_scale = (degree + 1) * (degree + 1);
+   real_t *P = element_penalties.Write();
+   real_t *P0 = local_p0.Write();
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
+   {
+      real_t volume = 0.0;
+      for (int q = 0; q < nqe; ++q)
+      {
+         volume += We[q] * fabs(Je[q + nqe * e]);
+      }
+      P[e] = degree_scale * A[e] / volume;
+      P0[e] = P[e];
+   });
+
+   if (nif > 0) { face_restriction->Mult(local_p0, restricted_p0); }
+   face_penalties = 0.0;
+   const int *IF = interior_faces.Read();
+   const real_t *RP0 = restricted_p0.Read();
+   real_t *FP = face_penalties.ReadWrite();
+   real_t *IQP = interior_quadrature_penalties.Write();
+   mfem::forall(nif, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const real_t penalty = fmax(RP0[2*i], RP0[2*i + 1]);
+      FP[IF[i]] = penalty;
+      for (int q = 0; q < nqf; ++q)
+      {
+         IQP[q + nqf * i] = penalty;
+      }
+   });
+   const int *BF = boundary_faces.Read();
+   real_t *BQP = boundary_quadrature_penalties.Write();
+   mfem::forall(nbf, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const real_t penalty = P[BE1[i]];
+      FP[BF[i]] = penalty;
+      for (int q = 0; q < nqf; ++q)
+      {
+         BQP[q + nqf * i] = penalty;
+      }
+   });
+}
+
+void SIPGeometryPenaltyOperator::FillInteriorQuadraturePenalties(
+   Vector &values) const
+{
+   const int nf = interior_faces.Size();
+   if (nf == 0)
+   {
+      MFEM_VERIFY(values.Size() == 0,
+                  "empty interior SIP quadrature vector has the wrong size");
+      return;
+   }
+   MFEM_VERIFY(values.Size() % nf == 0,
+               "interior SIP quadrature vector has the wrong size");
+   const int nq = values.Size() / nf;
+   const int *F = interior_faces.Read();
+   const real_t *P = face_penalties.Read();
+   real_t *V = values.Write();
+   mfem::forall(nf, [=] MFEM_HOST_DEVICE(int f)
+   {
+      const real_t penalty = P[F[f]];
+      for (int q = 0; q < nq; ++q)
+      {
+         V[q + nq * f] = penalty;
+      }
+   });
+}
+
+void SIPGeometryPenaltyOperator::FillBoundaryQuadraturePenalties(
+   Vector &values) const
+{
+   const int nf = boundary_faces.Size();
+   if (nf == 0)
+   {
+      MFEM_VERIFY(values.Size() == 0,
+                  "empty boundary SIP quadrature vector has the wrong size");
+      return;
+   }
+   MFEM_VERIFY(values.Size() % nf == 0,
+               "boundary SIP quadrature vector has the wrong size");
+   const int nq = values.Size() / nf;
+   const int *F = boundary_faces.Read();
+   const real_t *P = face_penalties.Read();
+   real_t *V = values.Write();
+   mfem::forall(nf, [=] MFEM_HOST_DEVICE(int f)
+   {
+      const real_t penalty = P[F[f]];
+      for (int q = 0; q < nq; ++q)
+      {
+         V[q + nq * f] = penalty;
+      }
+   });
+}
 
 void ParBilinearForm::pAllocMat()
 {

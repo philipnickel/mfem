@@ -49,9 +49,12 @@ void ParNonlinearForm::Mult(const Vector &x, Vector &y) const
 {
    NonlinearForm::Mult(x, y); // x --(P)--> aux1 --(A_local)--> aux2
 
-   if (fnfi.Size())
+   // Partial assembly owns a ParL2 face restriction that already gathers and
+   // scatters shared-face data.  The loop below is the legacy-only completion
+   // of locally assembled interior faces and would otherwise double count the
+   // shared contribution.
+   if (fnfi.Size() && !NonlinearForm::ext)
    {
-      MFEM_VERIFY(!NonlinearForm::ext, "Not implemented (extensions + faces");
       // Terms over shared interior faces in parallel.
       ParFiniteElementSpace *pfes = ParFESpace();
       ParMesh *pmesh = pfes->GetParMesh();

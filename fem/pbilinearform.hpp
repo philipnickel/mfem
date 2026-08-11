@@ -24,6 +24,47 @@
 namespace mfem
 {
 
+/** @brief Native Krank/Fehn SIP geometry coefficient for an equal-order
+    tensor-product mesh.
+
+    Update() computes (p+1)^2 (A_int/2 + A_bnd)/V per local element and the
+    maximum adjacent value per interior face. A P0 parallel face restriction
+    performs the shared-face exchange; results are indexed by mesh face. */
+class SIPGeometryPenaltyOperator
+{
+private:
+   ParMesh &mesh;
+   int degree;
+   const IntegrationRule &face_ir;
+   const IntegrationRule &element_ir;
+   std::unique_ptr<L2_FECollection> p0_fec;
+   std::unique_ptr<ParFiniteElementSpace> p0_fes;
+   const FaceRestriction *face_restriction = nullptr; ///< Not owned.
+   Array<int> interior_faces, boundary_faces;
+   Array<int> interior_e1, interior_e2, boundary_e1;
+   Vector element_penalties, face_penalties;
+   Vector interior_quadrature_penalties, boundary_quadrature_penalties;
+   Vector local_p0, restricted_p0, weighted_boundary;
+
+public:
+   SIPGeometryPenaltyOperator(ParMesh &mesh_, int degree_,
+                              const IntegrationRule &face_ir_,
+                              const IntegrationRule &element_ir_);
+   void Update();
+   const Vector &GetElementPenalties() const { return element_penalties; }
+   const Vector &GetFacePenalties() const { return face_penalties; }
+   const Vector &GetInteriorQuadraturePenalties() const
+   { return interior_quadrature_penalties; }
+   const Vector &GetBoundaryQuadraturePenalties() const
+   { return boundary_quadrature_penalties; }
+   /** Fill a face quadrature vector with the current interior penalties.
+       The vector may use any positive number of quadrature points per face;
+       penalties are constant on each face. */
+   void FillInteriorQuadraturePenalties(Vector &values) const;
+   /** Fill a face quadrature vector with the current boundary penalties. */
+   void FillBoundaryQuadraturePenalties(Vector &values) const;
+};
+
 /// Class for parallel bilinear form
 class ParBilinearForm : public BilinearForm
 {

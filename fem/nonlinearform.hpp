@@ -165,6 +165,10 @@ public:
    const Array<NonlinearFormIntegrator*> &GetBdrFaceIntegrators() const
    { return bfnfi; }
 
+   /// Access boundary-face markers in integrator order.
+   const Array<Array<int>*> &GetBdrFaceIntegratorMarkers() const
+   { return bfnfi_marker; }
+
    /// Specify essential boundary conditions.
    /** This method calls FiniteElementSpace::GetEssentialTrueDofs() and stores
        the result internally for use by other methods. If the @a rhs pointer is

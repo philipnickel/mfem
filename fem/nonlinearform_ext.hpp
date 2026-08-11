@@ -90,9 +90,17 @@ private:
 
 protected:
    mutable Vector xe, ye;
+   mutable Vector int_face_x, int_face_y;
+   mutable Vector bdr_face_x, bdr_face_y, bdr_face_work;
    const FiniteElementSpace &fes;
    const Array<NonlinearFormIntegrator*> &dnfi;
+   const Array<NonlinearFormIntegrator*> &fnfi;
+   const Array<NonlinearFormIntegrator*> &bfnfi;
+   const Array<Array<int>*> &bfnfi_marker;
    const Operator *elemR; // not owned
+   const FaceRestriction *int_face_restriction; // not owned
+   const FaceRestriction *bdr_face_restriction; // not owned
+   const Array<int> *bdr_face_attributes; // not owned
    mutable Gradient Grad;
 
 public:

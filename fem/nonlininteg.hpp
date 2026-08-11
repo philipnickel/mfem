@@ -99,6 +99,12 @@ public:
    virtual void AssemblePA(const FiniteElementSpace &trial_fes,
                            const FiniteElementSpace &test_fes);
 
+   /// Method defining partial assembly on interior faces.
+   virtual void AssemblePAInteriorFaces(const FiniteElementSpace &fes);
+
+   /// Method defining partial assembly on boundary faces.
+   virtual void AssemblePABoundaryFaces(const FiniteElementSpace &fes);
+
    /** @brief Prepare the integrator for partial assembly (PA) gradient
        evaluations on the given FE space @a fes at the state @a x. */
    /** The result of the partial assembly is stored internally so that it can be
@@ -119,6 +125,12 @@ public:
        This method can be called only after the method AssemblePA() has been
        called. */
    virtual void AddMultPA(const Vector &x, Vector &y) const;
+
+   /** @brief Partially assembled face action with access to the element
+       E-vector. The default delegates to AddMultPA(face_x, face_y). */
+   virtual void AddMultPAFace(const Vector &face_x,
+                              const Vector &element_x,
+                              Vector &face_y) const;
 
    /// Method for partially assembled gradient action.
    /** All arguments are E-vectors. This method can be called only after the
@@ -157,11 +169,54 @@ public:
    }
 };
 
+/** @brief Native volume integrator for a packed explicit ALE history.
+
+    The input finite-element space uses byNODES ordering with components
+
+    ``(u_0,...,u_(J-1),w)``, where every vector field contributes
+    ``mesh.SpaceDimension()`` consecutive components.  It places
+
+    ``sum_i beta_i (v, ((u_i-w).grad) u_i)``
+
+    in the first vector-field block of the packed output.  The remaining
+    output blocks are left unchanged.  The weight vector is not owned and
+    must remain valid for the lifetime of the integrator. */
+class ALEConvectionVolumeIntegrator : public NonlinearFormIntegrator
+{
+private:
+   int history_order;
+   const Vector *beta;
+
+   int dim = 0;
+   int ne = 0;
+   int nq = 0;
+   int dofs1D = 0;
+   int quad1D = 0;
+   const DofToQuad *maps = nullptr;
+   const GeometricFactors *geom = nullptr;
+
+   Vector shape;
+   DenseMatrix dshape;
+
+public:
+   ALEConvectionVolumeIntegrator(int order, const Vector &beta_weights);
+
+   void AssembleElementVector(const FiniteElement &el,
+                              ElementTransformation &Tr,
+                              const Vector &elfun,
+                              Vector &elvect) override;
+
+   void AssemblePA(const FiniteElementSpace &fes) override;
+
+   void AddMultPA(const Vector &x, Vector &y) const override;
+};
+
 /** @brief Native boundary-face integrator for a packed explicit ALE history.
 
     The input finite-element space uses byNODES ordering with components
 
-    ``(u_0x,u_0y,...,u_(J-1)x,u_(J-1)y,w_x,w_y[,scratch_x,scratch_y])``.
+    ``(u_0,...,u_(J-1),w[,scratch])``, where every vector field contributes
+    ``mesh.SpaceDimension()`` consecutive byNODES components.
 
     On a velocity-Dirichlet boundary this integrator applies the mirror-state
     correction
@@ -183,13 +238,28 @@ class ALEConvectionBoundaryIntegrator : public NonlinearFormIntegrator
 {
 private:
    int history_order;
-   int vdim;
    real_t upwind;
    const Vector *beta;
    const Vector *delta;
    VectorCoefficient *datum = nullptr;
    bool include_convection;
    bool include_pressure_delta;
+   bool include_continuity_scratch;
+
+   int dim = 0;
+   int nf = 0;
+   int nq = 0;
+   int ne = 0;
+   int dofs1D = 0;
+   int quad1D = 0;
+   int element_dofs = 0;
+   const DofToQuad *maps = nullptr;
+   const FaceGeometricFactors *geom = nullptr;
+   Vector pa_datum;
+   Array<int> pa_boundary_elements;
+   Vector pa_basis;
+   Vector pa_derivative;
+   Vector pa_inverse_jacobian;
 
    Vector shape, normal, datum_value;
    DenseMatrix dshape;
@@ -209,13 +279,22 @@ public:
                            FaceElementTransformations &Tr,
                            const Vector &elfun,
                            Vector &elvect) override;
+
+   void AssemblePABoundaryFaces(const FiniteElementSpace &fes) override;
+
+   void AddMultPA(const Vector &x, Vector &y) const override;
+
+   void AddMultPAFace(const Vector &face_x,
+                      const Vector &element_x,
+                      Vector &face_y) const override;
 };
 
 /** @brief Native interior-face integrator for a packed explicit ALE history.
 
     The input finite-element space uses byNODES ordering with components
 
-    ``(u_0x,u_0y,...,u_(J-1)x,u_(J-1)y,w_x,w_y)``.
+    ``(u_0,...,u_(J-1),w)``, where every vector field contributes
+    ``mesh.SpaceDimension()`` consecutive byNODES components.
 
     On each interior face, the integrator evaluates the two velocity traces
     and the two grid-velocity traces.  For history @a i, let
@@ -239,9 +318,15 @@ class ALEConvectionInteriorIntegrator : public NonlinearFormIntegrator
 {
 private:
    int history_order;
-   int vdim;
    real_t upwind;
    const Vector *beta;
+
+   int dim = 0;
+   int nf = 0;
+   int dofs1D = 0;
+   int quad1D = 0;
+   const DofToQuad *maps = nullptr;
+   const FaceGeometricFactors *geom = nullptr;
 
    Vector shape1, shape2, normal;
 
@@ -254,6 +339,10 @@ public:
                            FaceElementTransformations &Tr,
                            const Vector &elfun,
                            Vector &elvect) override;
+
+   void AssemblePAInteriorFaces(const FiniteElementSpace &fes) override;
+
+   void AddMultPA(const Vector &x, Vector &y) const override;
 };
 
 /** The abstract base class BlockNonlinearFormIntegrator is

@@ -12,6 +12,9 @@
 #include "dgmassinv.hpp"
 #include "bilinearform.hpp"
 #include "dgmassinv_kernels.hpp"
+#include "quadinterpolator.hpp"
+#include "qspace.hpp"
+#include "restriction.hpp"
 #include "../general/forall.hpp"
 
 #include <cmath>
@@ -19,6 +22,831 @@
 
 namespace mfem
 {
+
+SurfaceKinematicOperator::SurfaceKinematicOperator(
+   FiniteElementSpace &fes_, const IntegrationRule &ir_,
+   real_t upwind_factor_)
+   : Operator(fes_.GetVSize(), 3 * fes_.GetVSize()), fes(fes_), ir(ir_),
+     scalar_size(fes_.GetVSize()), ne(fes_.GetNE()),
+     nd(fes_.GetTypicalFE()->GetDof()), nq(ir_.GetNPoints()),
+     nd1d(0), nq1d(0), upwind_factor(upwind_factor_),
+     orientation(scalar_size)
+{
+   MFEM_VERIFY(fes.GetMesh()->Dimension() == 1,
+               "surface kinematics requires a one-dimensional trace mesh");
+   MFEM_VERIFY(fes.GetVDim() == 1 && fes.GetVSize() == fes.GetTrueVSize(),
+               "surface kinematics requires a scalar broken trace space");
+   SetUpwindFactor(upwind_factor_);
+   element_restriction = fes.GetElementRestriction(
+                            ElementDofOrdering::LEXICOGRAPHIC);
+   quadrature_interpolator = fes.GetQuadratureInterpolator(ir);
+   maps = &fes.GetTypicalFE()->GetDofToQuad(ir, DofToQuad::TENSOR);
+   nd1d = maps->ndof;
+   nq1d = maps->nqpt;
+   MFEM_VERIFY(element_restriction != nullptr &&
+               element_restriction->Height() == ne * nd &&
+               quadrature_interpolator != nullptr &&
+               nd1d == nd && nq1d == nq,
+               "surface kinematics requires tensor segment elements and rule");
+   quadrature_interpolator->EnableTensorProducts();
+   quadrature_interpolator->SetOutputLayout(QVectorLayout::byNODES);
+   face_restriction = fes.GetFaceRestriction(
+                         ElementDofOrdering::NATIVE, FaceType::Interior);
+   MFEM_VERIFY(face_restriction != nullptr,
+               "surface kinematics requires an interior face restriction");
+
+   orientation = 0.0;
+   Array<int> dofs;
+   IntegrationPoint left, right;
+   left.Set1w(0.0, 1.0);
+   right.Set1w(1.0, 1.0);
+   Vector x_left, x_right;
+   for (int e = 0; e < fes.GetNE(); ++e)
+   {
+      fes.GetElementDofs(e, dofs);
+      MFEM_VERIFY(dofs.Size() >= 2,
+                  "surface element must have two endpoint dofs");
+      ElementTransformation &T = *fes.GetElementTransformation(e);
+      T.Transform(left, x_left);
+      T.Transform(right, x_right);
+      const bool native_is_physical = x_left[0] < x_right[0];
+      const int left_dof = native_is_physical ? dofs[0] : dofs.Last();
+      const int right_dof = native_is_physical ? dofs.Last() : dofs[0];
+      MFEM_VERIFY(left_dof >= 0 && right_dof >= 0,
+                  "oriented scalar dofs are not supported");
+      orientation[left_dof] = -1.0;
+      orientation[right_dof] = 1.0;
+   }
+   const int face_size = face_restriction->Height();
+   MFEM_VERIFY(face_size % 2 == 0,
+               "surface face restriction must be double valued");
+   orientation_face.SetSize(face_size);
+   eta_face.SetSize(face_size);
+   velocity_face.SetSize(face_size);
+   face_flux.SetSize(face_size);
+   volume_flux.SetSize(scalar_size);
+   load.SetSize(scalar_size);
+   // The tail stores the signed, static one-dimensional Jacobians. The flat
+   // reference surface never moves, so they share the persistent element
+   // scratch allocation without another step-time vector.
+   // One scalar input scratch precedes the three restricted component
+   // blocks.  Copying a packed component with a device kernel avoids making
+   // a host-valid alias of a device-newer input Vector (the Python packed
+   // free-surface history path exercises exactly that case).
+   element_values.SetSize(4 * ne * nd + ne * nq);
+   eta_derivatives.SetSize(ne * nq);
+   velocity_values.SetSize(2 * ne * nq);
+   quadrature_load.SetSize(ne * nq);
+   element_load.SetSize(ne * nd);
+   element_rate.SetSize(ne * nd);
+   packed_input.SetSize(3 * scalar_size);
+   face_restriction->Mult(orientation, orientation_face);
+   orientation_face.HostRead();
+   for (int f = 0; f < face_size / 2; ++f)
+   {
+      const real_t a = orientation_face[2*f];
+      const real_t b = orientation_face[2*f + 1];
+      MFEM_VERIFY(a * b == -1.0,
+                  "surface face restriction must pair left/right endpoints");
+   }
+   inverse_mass.SetSize(ne * nd * nd);
+   Vector shape(nd);
+   DenseMatrix mass(nd), inverse_matrix;
+   for (int e = 0; e < ne; ++e)
+   {
+      const FiniteElement &fe = *fes.GetFE(e);
+      ElementTransformation &T = *fes.GetElementTransformation(e);
+      mass = 0.0;
+      for (int q = 0; q < ir.GetNPoints(); ++q)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         T.SetIntPoint(&ip);
+         fe.CalcShape(ip, shape);
+         element_values[4*ne*nd + q + nq*e] = T.Jacobian()(0, 0);
+         AddMult_a_VVt(ip.weight * std::abs(T.Weight()), shape, mass);
+      }
+      DenseMatrixInverse factor(mass, true);
+      factor.GetInverseMatrix(inverse_matrix);
+      for (int j = 0; j < nd; ++j)
+      {
+         for (int i = 0; i < nd; ++i)
+         {
+            inverse_mass[i + nd*(j + nd*e)] = inverse_matrix(i, j);
+         }
+      }
+   }
+   inverse_mass.UseDevice(true);
+   orientation.UseDevice(true);
+   orientation_face.UseDevice(true);
+   eta_face.UseDevice(true);
+   velocity_face.UseDevice(true);
+   face_flux.UseDevice(true);
+   volume_flux.UseDevice(true);
+   load.UseDevice(true);
+   element_values.UseDevice(true);
+   eta_derivatives.UseDevice(true);
+   velocity_values.UseDevice(true);
+   quadrature_load.UseDevice(true);
+   element_load.UseDevice(true);
+   element_rate.UseDevice(true);
+   packed_input.UseDevice(true);
+}
+
+void SurfaceKinematicOperator::SetUpwindFactor(real_t value)
+{
+   MFEM_VERIFY(value >= 0.0 && std::isfinite(value),
+               "surface upwind factor must be finite and non-negative");
+   upwind_factor = value;
+}
+
+void SurfaceKinematicOperator::Mult(const Vector &x, Vector &y) const
+{
+   const bool debug_device = Device::Allows(Backend::DEBUG_DEVICE);
+   MFEM_VERIFY(x.Size() == Width(), "surface kinematic input has wrong size");
+   const real_t *X = x.Read();
+   // Preserve the immutable signed-Jacobian tail populated at construction.
+   real_t *component_data = element_values.ReadWrite();
+   for (int c = 0; c < 3; ++c)
+   {
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         component_data[i] = X[i + c*scalar_size];
+      });
+      Vector component, e_component;
+      component.MakeRef(element_values, 0, scalar_size);
+      e_component.MakeRef(element_values, (1 + c) * ne * nd, ne * nd);
+      element_restriction->Mult(component, e_component);
+   }
+   if (debug_device)
+   {
+      MFEM_VERIFY(element_values.CheckFinite() == 0,
+                  "surface restricted values are not finite");
+   }
+   Vector eta_element, velocity_x_element, velocity_y_element;
+   Vector velocity_x_q, velocity_y_q;
+   eta_element.MakeRef(element_values, ne * nd, ne * nd);
+   velocity_x_element.MakeRef(element_values, 2 * ne * nd, ne * nd);
+   velocity_y_element.MakeRef(element_values, 3 * ne * nd, ne * nd);
+   velocity_x_q.MakeRef(velocity_values, 0, ne * nq);
+   velocity_y_q.MakeRef(velocity_values, ne * nq, ne * nq);
+   quadrature_interpolator->Derivatives(eta_element, eta_derivatives);
+   quadrature_interpolator->Values(velocity_x_element, velocity_x_q);
+   quadrature_interpolator->Values(velocity_y_element, velocity_y_q);
+   if (debug_device)
+   {
+      MFEM_VERIFY(eta_derivatives.CheckFinite() == 0,
+                  "surface eta derivatives are not finite");
+      MFEM_VERIFY(velocity_values.CheckFinite() == 0,
+                  "surface velocity values are not finite");
+   }
+
+   const real_t *W = ir.GetWeights().Read();
+   const real_t *J = element_values.Read() + 4*ne*nd;
+   const real_t *E = eta_derivatives.Read();
+   const real_t *U = velocity_values.Read();
+   real_t *Q = quadrature_load.Write();
+   const int nq_ne = nq * ne;
+   mfem::forall(ne * nq, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int q = i % nq;
+      const int e = i / nq;
+      const real_t jacobian = J[q + nq*e];
+      const real_t value = U[i + nq_ne] - U[i] * E[i] / jacobian;
+      Q[i] = W[q] * fabs(jacobian) * value;
+   });
+   if (debug_device)
+   {
+      MFEM_VERIFY(quadrature_load.CheckFinite() == 0,
+                  "surface quadrature load is not finite");
+   }
+
+   const real_t *B = maps->B.Read();
+   const real_t *QL = quadrature_load.Read();
+   real_t *EL = element_load.Write();
+   mfem::forall(ne * nd, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d = i % nd;
+      const int e = i / nd;
+      real_t value = 0.0;
+      for (int q = 0; q < nq1d; ++q)
+      {
+         value += B[q + nq1d*d] * QL[q + nq*e];
+      }
+      EL[i] = value;
+   });
+   load = 0.0;
+   element_restriction->MultTranspose(element_load, load);
+   if (debug_device)
+   {
+      MFEM_VERIFY(load.CheckFinite() == 0,
+                  "surface volume load is not finite");
+   }
+
+   if (face_restriction->Height())
+   {
+      Vector component;
+      component.MakeRef(element_values, 0, scalar_size);
+      const real_t *packed = x.Read();
+      real_t *scalar = element_values.ReadWrite();
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         scalar[i] = packed[i];
+      });
+      face_restriction->Mult(component, eta_face);
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         scalar[i] = packed[i + scalar_size];
+      });
+      face_restriction->Mult(component, velocity_face);
+      if (debug_device)
+      {
+         MFEM_VERIFY(eta_face.CheckFinite() == 0,
+                     "surface eta face values are not finite");
+         MFEM_VERIFY(velocity_face.CheckFinite() == 0,
+                     "surface velocity face values are not finite");
+      }
+      const int nfaces = face_restriction->Height() / 2;
+      const real_t *O = orientation_face.Read();
+      const real_t *EF = eta_face.Read();
+      const real_t *UF = velocity_face.Read();
+      real_t *F = face_flux.Write();
+      const real_t alpha = upwind_factor;
+      mfem::forall(nfaces, [=] MFEM_HOST_DEVICE(int f)
+      {
+         const bool first_is_left = O[2*f] > 0.0;
+         const int left = 2*f + (first_is_left ? 0 : 1);
+         const int right = 2*f + (first_is_left ? 1 : 0);
+         const real_t eta_left = EF[left];
+         const real_t eta_right = EF[right];
+         const real_t u_left = UF[left];
+         const real_t u_right = UF[right];
+         const real_t speed = 0.5 * (u_left + u_right);
+         const real_t radius = alpha * fmax(fabs(u_left), fabs(u_right));
+         const real_t jump = eta_left - eta_right;
+         const real_t flux_left = 0.5 * (speed - radius) * jump;
+         const real_t flux_right = 0.5 * (speed + radius) * jump;
+         F[left] = flux_left;
+         F[right] = flux_right;
+      });
+      volume_flux = 0.0;
+      face_restriction->MultTranspose(face_flux, volume_flux);
+      load += volume_flux;
+      if (debug_device)
+      {
+         MFEM_VERIFY(load.CheckFinite() == 0,
+                     "surface face-corrected load is not finite");
+      }
+   }
+
+   element_restriction->Mult(load, element_load);
+   const real_t *IM = inverse_mass.Read();
+   const real_t *L = element_load.Read();
+   real_t *R = element_rate.Write();
+   mfem::forall(ne * nd, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d = i % nd;
+      const int e = i / nd;
+      real_t value = 0.0;
+      for (int j = 0; j < nd; ++j)
+      {
+         value += IM[d + nd*(j + nd*e)] * L[j + nd*e];
+      }
+      R[i] = value;
+   });
+   y.SetSize(scalar_size);
+   y.UseDevice(true);
+   y = 0.0;
+   element_restriction->MultTranspose(element_rate, y);
+   if (debug_device)
+   {
+      MFEM_VERIFY(y.CheckFinite() == 0,
+                  "surface kinematic result is not finite");
+   }
+}
+
+void SurfaceKinematicOperator::Mult3(const Vector &elevation,
+                                     const Vector &velocity_x,
+                                     const Vector &velocity_y,
+                                     Vector &rate) const
+{
+   MFEM_VERIFY(elevation.Size() == scalar_size &&
+               velocity_x.Size() == scalar_size &&
+               velocity_y.Size() == scalar_size,
+               "surface kinematic scalar input has wrong size");
+   const real_t *E = elevation.Read();
+   const real_t *U = velocity_x.Read();
+   const real_t *V = velocity_y.Read();
+   real_t *X = packed_input.Write();
+   mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+   {
+      X[i] = E[i];
+      X[i + scalar_size] = U[i];
+      X[i + 2*scalar_size] = V[i];
+   });
+   if (Device::Allows(Backend::DEBUG_DEVICE))
+   {
+      MFEM_VERIFY(packed_input.CheckFinite() == 0,
+                  "surface packed input is not finite");
+   }
+   Mult(packed_input, rate);
+}
+
+SurfaceKinematicOperator2D::SurfaceKinematicOperator2D(
+   FiniteElementSpace &fes_, const IntegrationRule &ir_,
+   real_t upwind_factor_)
+   : Operator(fes_.GetVSize(), 4 * fes_.GetVSize()), fes(fes_), ir(ir_),
+     scalar_size(fes_.GetVSize()), ne(fes_.GetNE()),
+     nd(fes_.GetTypicalFE()->GetDof()), nq(ir_.GetNPoints()),
+     nd1d(0), nq1d(0), nf(0), face_nd(0), face_nq(0),
+     sdim(fes_.GetMesh()->SpaceDimension()),
+     upwind_factor(upwind_factor_)
+{
+   MFEM_VERIFY(fes.GetMesh()->Dimension() == 2 && sdim >= 2,
+               "2D surface kinematics requires a two-dimensional trace mesh");
+   MFEM_VERIFY(fes.GetVDim() == 1 && fes.GetVSize() == fes.GetTrueVSize(),
+               "2D surface kinematics requires a scalar broken trace space");
+   MFEM_VERIFY(fes.GetTypicalFE()->GetGeomType() == Geometry::SQUARE,
+               "2D surface kinematics requires quadrilateral elements");
+   SetUpwindFactor(upwind_factor_);
+
+   element_restriction = fes.GetElementRestriction(
+                            ElementDofOrdering::LEXICOGRAPHIC);
+   quadrature_interpolator = fes.GetQuadratureInterpolator(ir);
+   maps = &fes.GetTypicalFE()->GetDofToQuad(ir, DofToQuad::TENSOR);
+   nd1d = maps->ndof;
+   nq1d = maps->nqpt;
+   MFEM_VERIFY(element_restriction != nullptr &&
+               element_restriction->Height() == ne * nd &&
+               quadrature_interpolator != nullptr &&
+               nd1d * nd1d == nd && nq1d * nq1d == nq,
+               "2D surface kinematics requires tensor quadrilaterals and rule");
+   quadrature_interpolator->EnableTensorProducts();
+   quadrature_interpolator->SetOutputLayout(QVectorLayout::byNODES);
+
+   face_ir = &IntRules.Get(Geometry::SEGMENT, ir.GetOrder());
+   const FiniteElement &trace_fe = *fes.GetTypicalTraceElement();
+   face_maps = &trace_fe.GetDofToQuad(*face_ir, DofToQuad::TENSOR);
+   face_nd = face_maps->ndof;
+   face_nq = face_maps->nqpt;
+   face_restriction = fes.GetFaceRestriction(
+                         ElementDofOrdering::LEXICOGRAPHIC,
+                         FaceType::Interior, L2FaceValues::DoubleValued);
+   FaceQuadratureSpace faces(*fes.GetMesh(), *face_ir, FaceType::Interior);
+   nf = faces.GetNumFaces();
+   MFEM_VERIFY((nf == 0 || face_restriction != nullptr) &&
+               (!face_restriction ||
+                face_restriction->Height() == 2 * nf * face_nd),
+               "2D surface interior-face restriction has the wrong layout");
+
+   inverse_mass.SetSize(ne * nd * nd);
+   volume_weights.SetSize(ne * nq);
+   gradient_map.SetSize(4 * ne * nq);
+   Vector shape(nd);
+   DenseMatrix mass(nd), inverse_matrix;
+   for (int e = 0; e < ne; ++e)
+   {
+      const FiniteElement &fe = *fes.GetFE(e);
+      ElementTransformation &T = *fes.GetElementTransformation(e);
+      mass = 0.0;
+      for (int q = 0; q < nq; ++q)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         T.SetIntPoint(&ip);
+         const DenseMatrix &J = T.Jacobian();
+         MFEM_VERIFY(J.Height() >= 2 && J.Width() == 2,
+                     "surface element Jacobian has the wrong shape");
+         const real_t J00 = J(0, 0);
+         const real_t J01 = J(0, 1);
+         const real_t J10 = J(1, 0);
+         const real_t J11 = J(1, 1);
+         const real_t det_horizontal = J00 * J11 - J01 * J10;
+         MFEM_VERIFY(std::abs(det_horizontal) > 0.0 &&
+                     std::isfinite(det_horizontal),
+                     "surface graph map has a singular horizontal Jacobian");
+         const int base = 4 * (q + nq * e);
+         gradient_map[base + 0] =  J11 / det_horizontal;
+         gradient_map[base + 1] = -J01 / det_horizontal;
+         gradient_map[base + 2] = -J10 / det_horizontal;
+         gradient_map[base + 3] =  J00 / det_horizontal;
+         volume_weights[q + nq * e] = ip.weight * std::abs(T.Weight());
+         fe.CalcShape(ip, shape);
+         AddMult_a_VVt(volume_weights[q + nq * e], shape, mass);
+      }
+      DenseMatrixInverse factor(mass, true);
+      factor.GetInverseMatrix(inverse_matrix);
+      for (int j = 0; j < nd; ++j)
+      {
+         for (int i = 0; i < nd; ++i)
+         {
+            inverse_mass[i + nd * (j + nd * e)] = inverse_matrix(i, j);
+         }
+      }
+   }
+
+   face_weights.SetSize(nf * face_nq);
+   face_normals.SetSize(2 * nf * face_nq);
+   Mesh &mesh = *fes.GetMesh();
+   for (int f = 0; f < nf; ++f)
+   {
+      const int mesh_face = faces.GetMeshFaceIndex(f);
+      FaceElementTransformations *T = mesh.GetFaceElementTransformations(mesh_face);
+      MFEM_VERIFY(T != nullptr && T->Elem1 != nullptr && T->Face != nullptr,
+                  "surface interior face transformation is incomplete");
+      const IntegrationPoint &center =
+         Geometries.GetCenter(T->Elem1->GetGeometryType());
+      Vector element_center, face_point;
+      T->Elem1->Transform(center, element_center);
+      for (int q = 0; q < face_nq; ++q)
+      {
+         const IntegrationPoint &ip = face_ir->IntPoint(q);
+         T->SetAllIntPoints(&ip);
+         const DenseMatrix &J = T->Face->Jacobian();
+         MFEM_VERIFY(J.Height() >= 2 && J.Width() == 1,
+                     "surface edge Jacobian has the wrong shape");
+         const real_t tangent_x = J(0, 0);
+         const real_t tangent_y = J(1, 0);
+         const real_t horizontal_measure =
+            std::sqrt(tangent_x * tangent_x + tangent_y * tangent_y);
+         MFEM_VERIFY(horizontal_measure > 0.0 && std::isfinite(horizontal_measure),
+                     "surface edge has zero horizontal measure");
+         real_t normal_x = tangent_y / horizontal_measure;
+         real_t normal_y = -tangent_x / horizontal_measure;
+         T->Elem1->Transform(T->GetElement1IntPoint(), face_point);
+         if (normal_x * (face_point[0] - element_center[0]) +
+             normal_y * (face_point[1] - element_center[1]) < 0.0)
+         {
+            normal_x = -normal_x;
+            normal_y = -normal_y;
+         }
+         face_normals[2 * (q + face_nq * f) + 0] = normal_x;
+         face_normals[2 * (q + face_nq * f) + 1] = normal_y;
+         face_weights[q + face_nq * f] =
+            ip.weight * std::abs(T->Face->Weight());
+      }
+   }
+
+   element_values.SetSize(5 * ne * nd);
+   eta_derivatives.SetSize(2 * ne * nq);
+   velocity_values.SetSize(3 * ne * nq);
+   quadrature_load.SetSize(ne * nq);
+   element_load.SetSize(ne * nd);
+   element_rate.SetSize(ne * nd);
+   const int face_size = 2 * nf * face_nd;
+   face_element_values.SetSize(4 * face_size);
+   face_values.SetSize(4 * 2 * nf * face_nq);
+   face_quadrature_flux.SetSize(2 * nf * face_nq);
+   face_element_flux.SetSize(face_size);
+   volume_flux.SetSize(scalar_size);
+   load.SetSize(scalar_size);
+   packed_input.SetSize(4 * scalar_size);
+
+   inverse_mass.UseDevice(true);
+   volume_weights.UseDevice(true);
+   gradient_map.UseDevice(true);
+   face_weights.UseDevice(true);
+   face_normals.UseDevice(true);
+   element_values.UseDevice(true);
+   eta_derivatives.UseDevice(true);
+   velocity_values.UseDevice(true);
+   quadrature_load.UseDevice(true);
+   element_load.UseDevice(true);
+   element_rate.UseDevice(true);
+   face_element_values.UseDevice(true);
+   face_values.UseDevice(true);
+   face_quadrature_flux.UseDevice(true);
+   face_element_flux.UseDevice(true);
+   volume_flux.UseDevice(true);
+   load.UseDevice(true);
+   packed_input.UseDevice(true);
+}
+
+void SurfaceKinematicOperator2D::SetUpwindFactor(real_t value)
+{
+   MFEM_VERIFY(value >= 0.0 && std::isfinite(value),
+               "surface upwind factor must be finite and non-negative");
+   upwind_factor = value;
+}
+
+void SurfaceKinematicOperator2D::Mult(const Vector &x, Vector &y) const
+{
+   const bool debug_device = Device::Allows(Backend::DEBUG_DEVICE);
+   MFEM_VERIFY(x.Size() == Width(), "2D surface kinematic input has wrong size");
+   const real_t *X = x.Read();
+   real_t *scratch = element_values.Write();
+   for (int c = 0; c < 4; ++c)
+   {
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         scratch[i] = X[i + c * scalar_size];
+      });
+      Vector component, restricted;
+      component.MakeRef(element_values, 0, scalar_size);
+      restricted.MakeRef(element_values, (1 + c) * ne * nd, ne * nd);
+      element_restriction->Mult(component, restricted);
+   }
+
+   Vector eta_element;
+   eta_element.MakeRef(element_values, ne * nd, ne * nd);
+   quadrature_interpolator->Derivatives(eta_element, eta_derivatives);
+   for (int c = 0; c < 3; ++c)
+   {
+      Vector velocity_element, velocity_q;
+      velocity_element.MakeRef(element_values, (2 + c) * ne * nd, ne * nd);
+      velocity_q.MakeRef(velocity_values, c * ne * nq, ne * nq);
+      quadrature_interpolator->Values(velocity_element, velocity_q);
+   }
+   if (debug_device)
+   {
+      MFEM_VERIFY(eta_derivatives.CheckFinite() == 0 &&
+                  velocity_values.CheckFinite() == 0,
+                  "2D surface quadrature state is not finite");
+   }
+
+   const real_t *D = eta_derivatives.Read();
+   const real_t *U = velocity_values.Read();
+   const real_t *G = gradient_map.Read();
+   const real_t *VW = volume_weights.Read();
+   real_t *Q = quadrature_load.Write();
+   const int nq_ne = nq * ne;
+   mfem::forall(nq_ne, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int q = i % nq;
+      const int e = i / nq;
+      const int base = 4 * i;
+      // QVectorLayout::byNODES stores reference derivatives as
+      // (quadrature point, component, derivative, element). For this scalar
+      // space the derivative index therefore sits inside the element block,
+      // not in one global derivative block.
+      const real_t derivative_0 = D[q + nq * (0 + 2 * e)];
+      const real_t derivative_1 = D[q + nq * (1 + 2 * e)];
+      const real_t gradient_x =
+         G[base + 0] * derivative_0 + G[base + 2] * derivative_1;
+      const real_t gradient_y =
+         G[base + 1] * derivative_0 + G[base + 3] * derivative_1;
+      Q[i] = VW[i] *
+             (U[i + 2 * nq_ne] - U[i] * gradient_x -
+              U[i + nq_ne] * gradient_y);
+   });
+
+   const real_t *B = maps->B.Read();
+   const real_t *QL = quadrature_load.Read();
+   real_t *EL = element_load.Write();
+   mfem::forall(ne * nd, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d1 = i % nd1d;
+      const int d2 = (i / nd1d) % nd1d;
+      const int e = i / nd;
+      real_t value = 0.0;
+      for (int q2 = 0; q2 < nq1d; ++q2)
+      {
+         for (int q1 = 0; q1 < nq1d; ++q1)
+         {
+            value += B[q1 + nq1d * d1] * B[q2 + nq1d * d2] *
+                     QL[q1 + nq1d * q2 + nq * e];
+         }
+      }
+      EL[i] = value;
+   });
+   load = 0.0;
+   element_restriction->MultTranspose(element_load, load);
+
+   if (nf > 0)
+   {
+      const int face_size = 2 * nf * face_nd;
+      for (int c = 0; c < 4; ++c)
+      {
+         Vector component, restricted;
+         component.MakeRef(element_values, 0, scalar_size);
+         const real_t *packed = x.Read();
+         real_t *scalar = element_values.Write();
+         mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+         {
+            scalar[i] = packed[i + c * scalar_size];
+         });
+         restricted.MakeRef(face_element_values, c * face_size, face_size);
+         face_restriction->Mult(component, restricted);
+      }
+
+      const real_t *FB = face_maps->B.Read();
+      const real_t *FE = face_element_values.Read();
+      real_t *FV = face_values.Write();
+      const int values_per_component = 2 * nf * face_nq;
+      mfem::forall(4 * values_per_component, [=] MFEM_HOST_DEVICE(int i)
+      {
+         const int q = i % face_nq;
+         const int side = (i / face_nq) % 2;
+         const int face = (i / (2 * face_nq)) % nf;
+         const int component = i / values_per_component;
+         real_t value = 0.0;
+         for (int d = 0; d < face_nd; ++d)
+         {
+            const int source =
+               d + face_nd * (side + 2 * (face + nf * component));
+            value += FB[q + face_nq * d] * FE[source];
+         }
+         FV[i] = value;
+      });
+
+      const real_t *N = face_normals.Read();
+      const real_t *FW = face_weights.Read();
+      const real_t *S = face_values.Read();
+      real_t *FQ = face_quadrature_flux.Write();
+      const real_t alpha = upwind_factor;
+      mfem::forall(nf * face_nq, [=] MFEM_HOST_DEVICE(int i)
+      {
+         const int q = i % face_nq;
+         const int face = i / face_nq;
+         const int side0 = q + face_nq * (0 + 2 * face);
+         const int side1 = q + face_nq * (1 + 2 * face);
+         const real_t normal_x = N[2 * i + 0];
+         const real_t normal_y = N[2 * i + 1];
+         const real_t eta0 = S[side0];
+         const real_t eta1 = S[side1];
+         const real_t ux0 = S[side0 + values_per_component];
+         const real_t ux1 = S[side1 + values_per_component];
+         const real_t uy0 = S[side0 + 2 * values_per_component];
+         const real_t uy1 = S[side1 + 2 * values_per_component];
+         const real_t speed0 = ux0 * normal_x + uy0 * normal_y;
+         const real_t speed1 = ux1 * normal_x + uy1 * normal_y;
+         const real_t speed = 0.5 * (speed0 + speed1);
+         const real_t radius = alpha * fmax(fabs(speed0), fabs(speed1));
+         const real_t jump = eta0 - eta1;
+         const real_t scale = FW[i];
+         FQ[side0] = scale * 0.5 * (speed - radius) * jump;
+         FQ[side1] = scale * 0.5 * (speed + radius) * jump;
+      });
+
+      const real_t *FBt = face_maps->Bt.Read();
+      const real_t *FQL = face_quadrature_flux.Read();
+      real_t *FEL = face_element_flux.Write();
+      mfem::forall(2 * nf * face_nd, [=] MFEM_HOST_DEVICE(int i)
+      {
+         const int d = i % face_nd;
+         const int side = (i / face_nd) % 2;
+         const int face = i / (2 * face_nd);
+         real_t value = 0.0;
+         for (int q = 0; q < face_nq; ++q)
+         {
+            value += FBt[d + face_nd * q] *
+                     FQL[q + face_nq * (side + 2 * face)];
+         }
+         FEL[i] = value;
+      });
+      volume_flux = 0.0;
+      face_restriction->MultTranspose(face_element_flux, volume_flux);
+      load += volume_flux;
+   }
+
+   element_restriction->Mult(load, element_load);
+   const real_t *IM = inverse_mass.Read();
+   const real_t *L = element_load.Read();
+   real_t *R = element_rate.Write();
+   mfem::forall(ne * nd, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d = i % nd;
+      const int e = i / nd;
+      real_t value = 0.0;
+      for (int j = 0; j < nd; ++j)
+      {
+         value += IM[d + nd * (j + nd * e)] * L[j + nd * e];
+      }
+      R[i] = value;
+   });
+   y.SetSize(scalar_size);
+   y.UseDevice(true);
+   y = 0.0;
+   element_restriction->MultTranspose(element_rate, y);
+   if (debug_device)
+   {
+      MFEM_VERIFY(y.CheckFinite() == 0,
+                  "2D surface kinematic result is not finite");
+   }
+}
+
+void SurfaceKinematicOperator2D::Mult4(
+   const Vector &elevation, const Vector &velocity_x,
+   const Vector &velocity_y, const Vector &velocity_z, Vector &rate) const
+{
+   MFEM_VERIFY(elevation.Size() == scalar_size &&
+               velocity_x.Size() == scalar_size &&
+               velocity_y.Size() == scalar_size &&
+               velocity_z.Size() == scalar_size,
+               "2D surface kinematic scalar input has wrong size");
+   const real_t *E = elevation.Read();
+   const real_t *U = velocity_x.Read();
+   const real_t *V = velocity_y.Read();
+   const real_t *W = velocity_z.Read();
+   real_t *X = packed_input.Write();
+   mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+   {
+      X[i] = E[i];
+      X[i + scalar_size] = U[i];
+      X[i + 2 * scalar_size] = V[i];
+      X[i + 3 * scalar_size] = W[i];
+   });
+   Mult(packed_input, rate);
+}
+
+ElementMeanMagnitudeOperator::ElementMeanMagnitudeOperator(
+   FiniteElementSpace &fes_, const IntegrationRule &ir_)
+   : Operator(fes_.GetNE(),
+              fes_.GetMesh()->Dimension() * fes_.GetVSize()),
+     fes(fes_), ir(ir_), dim(fes_.GetMesh()->Dimension()),
+     scalar_size(fes_.GetVSize()), ne(fes_.GetNE()),
+     nd(fes_.GetTypicalFE()->GetDof()), nq(ir_.GetNPoints()),
+     element_values(2 * ne * nd), quadrature_values(dim * ne * nq),
+     volumes(ne)
+{
+   MFEM_VERIFY(dim == 2 || dim == 3,
+               "element mean magnitude supports 2D and 3D meshes");
+   MFEM_VERIFY(fes.GetVDim() == 1,
+               "element mean magnitude requires a scalar base space");
+   MFEM_VERIFY(fes.GetVSize() == fes.GetTrueVSize(),
+               "element mean magnitude requires a broken scalar space");
+   element_restriction = fes.GetElementRestriction(
+                            ElementDofOrdering::LEXICOGRAPHIC);
+   quadrature_interpolator = fes.GetQuadratureInterpolator(ir);
+   MFEM_VERIFY(element_restriction != nullptr &&
+               element_restriction->Height() == ne * nd,
+               "element mean magnitude requires a tensor element restriction");
+   MFEM_VERIFY(quadrature_interpolator != nullptr,
+               "element mean magnitude requires a quadrature interpolator");
+   quadrature_interpolator->EnableTensorProducts();
+   quadrature_interpolator->SetOutputLayout(QVectorLayout::byNODES);
+   element_values.UseDevice(true);
+   quadrature_values.UseDevice(true);
+   volumes.UseDevice(true);
+}
+
+void ElementMeanMagnitudeOperator::Mult(const Vector &x, Vector &y) const
+{
+   MFEM_VERIFY(x.Size() == Width(), "element mean input has the wrong size");
+   y.SetSize(Height());
+   y.UseDevice(true);
+   for (int c = 0; c < dim; ++c)
+   {
+      Vector component, restricted_component, q_component;
+      component.MakeRef(element_values, 0, ne * nd);
+      restricted_component.MakeRef(element_values, ne * nd, ne * nd);
+      q_component.MakeRef(quadrature_values, c * ne * nq, ne * nq);
+      const real_t *X = x.Read();
+      real_t *C = component.Write();
+      const int offset = c * scalar_size;
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         C[i] = X[offset + i];
+      });
+      element_restriction->Mult(component, restricted_component);
+      quadrature_interpolator->Values(restricted_component, q_component);
+   }
+
+   const GeometricFactors *geom = fes.GetMesh()->GetGeometricFactors(
+                                     ir, GeometricFactors::DETERMINANTS);
+   const real_t *W = ir.GetWeights().Read();
+   const real_t *J = geom->detJ.Read();
+   const real_t *Q = quadrature_values.Read();
+   real_t *V = volumes.Write();
+   real_t *Y = y.Write();
+   const int nqe = nq * ne;
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
+   {
+      real_t integral[3] = {0.0, 0.0, 0.0};
+      real_t volume = 0.0;
+      for (int q = 0; q < nq; ++q)
+      {
+         const real_t weight = W[q] * fabs(J[q + nq * e]);
+         volume += weight;
+         for (int c = 0; c < dim; ++c)
+         {
+            integral[c] += weight * Q[q + nq * e + c * nqe];
+         }
+      }
+      V[e] = volume;
+      real_t magnitude2 = 0.0;
+      for (int c = 0; c < dim; ++c)
+      {
+         const real_t mean = integral[c] / volume;
+         magnitude2 += mean * mean;
+      }
+      Y[e] = sqrt(magnitude2);
+   });
+}
+
+void ElementMeanMagnitudeOperator::ComputeTau(
+   const Vector &mean, real_t scale, Vector &tau) const
+{
+   MFEM_VERIFY(mean.Size() == ne, "element mean vector has the wrong size");
+   tau.SetSize(ne);
+   tau.UseDevice(true);
+   const real_t *M = mean.Read();
+   const real_t *V = volumes.Read();
+   real_t *T = tau.Write();
+   const real_t inverse_dimension = 1.0 / dim;
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
+   {
+      T[e] = scale * M[e] * pow(V[e], inverse_dimension);
+   });
+}
 
 namespace
 {

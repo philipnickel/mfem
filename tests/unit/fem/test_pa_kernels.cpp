@@ -230,20 +230,37 @@ TEST_CASE("PA VectorDivDiv on curved L2 elements",
           "[PartialAssembly][GPU][VectorDivDiv]")
 {
    constexpr int order = 3;
+   const int dim = GENERATE(2, 3);
    const int q1d = GENERATE(order + 1, order + 2);
+   CAPTURE(dim);
    CAPTURE(q1d);
-   Mesh mesh = Mesh::MakeCartesian2D(
-                  3, 2, Element::QUADRILATERAL, true, 1.0, 1.0);
-   mesh.SetCurvature(order, false, 2, Ordering::byNODES);
+   Mesh mesh;
+   if (dim == 2)
+   {
+      mesh = Mesh::MakeCartesian2D(
+                3, 2, Element::QUADRILATERAL, true, 1.0, 1.0);
+   }
+   else
+   {
+      mesh = Mesh::MakeCartesian3D(
+                2, 2, 2, Element::HEXAHEDRON, 1.0, 1.0, 1.0);
+   }
+   mesh.SetCurvature(order, false, dim, Ordering::byNODES);
    mesh.Transform([](const Vector &xold, Vector &xnew)
    {
       xnew = xold;
-      xnew(1) += 0.08*sin(M_PI*xold(0))*sin(M_PI*xold(1));
+      real_t perturbation = 0.08;
+      for (int d = 0; d < xold.Size(); ++d)
+      {
+         perturbation *= sin(M_PI*xold(d));
+      }
+      xnew(xnew.Size() - 1) += perturbation;
    });
 
-   L2_FECollection fec(order, 2, BasisType::GaussLobatto);
-   FiniteElementSpace fes(&mesh, &fec, 2, Ordering::byNODES);
-   const IntegrationRule &ir = IntRules.Get(Geometry::SQUARE, 2*q1d - 2);
+   L2_FECollection fec(order, dim, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&mesh, &fec, dim, Ordering::byNODES);
+   const Geometry::Type geometry = dim == 2 ? Geometry::SQUARE : Geometry::CUBE;
+   const IntegrationRule &ir = IntRules.Get(geometry, 2*q1d - 2);
 
    Vector tau(mesh.GetNE());
    for (int e = 0; e < tau.Size(); ++e) { tau[e] = 0.2 + 0.07*e; }
