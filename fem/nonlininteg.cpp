@@ -974,37 +974,192 @@ static void PAALEPressureBoundaryApply2D(
    });
 }
 
+template<int T_D1D = 0, int T_Q1D = 0>
+static void PAALEPressureAcceleration3D(
+   const int history_order, const bool continuity_scratch,
+   const int d1d, const int q1d, const int nf, const int ne,
+   const DofToQuad &maps, const Vector &normal_basis_,
+   const Vector &normal_derivative_, const Vector &inverse_jacobian_,
+   const Array<int> &boundary_elements, const Array<int> &boundary_face_ids,
+   const Vector &state_, const Vector &element_x_, Vector &acceleration_,
+   const int *attributes = nullptr, const int *marker = nullptr,
+   const int marker_size = 0)
+{
+   const int D1D = T_D1D ? T_D1D : d1d;
+   const int Q1D = T_Q1D ? T_Q1D : q1d;
+   constexpr int max_D1D = T_D1D ? T_D1D : ALE_FACE_MAX_D1D;
+   constexpr int max_Q1D = T_Q1D ? T_Q1D : ALE_FACE_MAX_Q1D;
+   const int dim = 3;
+   const int vdim = dim * (history_order + 1 + (continuity_scratch ? 1 : 0));
+   const int nq = Q1D * Q1D;
+   auto B = Reshape(maps.B.Read(), Q1D, D1D);
+   auto G = Reshape(maps.G.Read(), Q1D, D1D);
+   auto normal_basis = Reshape(normal_basis_.Read(), D1D, 2);
+   auto normal_derivative = Reshape(normal_derivative_.Read(), D1D, 2);
+   auto inverse_jacobian =
+      Reshape(inverse_jacobian_.Read(), dim, dim, nq, nf);
+   auto elements = boundary_elements.Read();
+   auto face_ids = boundary_face_ids.Read();
+   auto state = Reshape(state_.Read(), Q1D, Q1D, vdim, 2, nf);
+   auto element_x =
+      Reshape(element_x_.Read(), D1D, D1D, D1D, vdim, ne);
+   auto acceleration =
+      Reshape(acceleration_.Write(), Q1D, Q1D, dim, history_order, nf);
+
+   mfem::forall(nf * history_order * dim,
+                [=] MFEM_HOST_DEVICE(int index)
+   {
+      const int face = index / (history_order * dim);
+      const int history = (index / dim) % history_order;
+      const int component = index % dim;
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             marker[attribute - 1] == 0) { return; }
+      }
+
+      const int face_id = face_ids[face];
+      const int normal_direction =
+         (face_id == 0 || face_id == 5) ? 2 :
+         (face_id == 1 || face_id == 3) ? 1 : 0;
+      const int tangent1 = normal_direction == 0 ? 1 : 0;
+      const int tangent2 = normal_direction == 2 ? 1 : 2;
+      const int level = (face_id == 2 || face_id == 3 || face_id == 5) ? 1 : 0;
+      const int element = elements[face];
+
+      real_t face_value[max_D1D][max_D1D];
+      real_t face_normal_derivative[max_D1D][max_D1D];
+      for (int d2 = 0; d2 < D1D; ++d2)
+      {
+         for (int d1 = 0; d1 < D1D; ++d1)
+         {
+            real_t value = 0.0;
+            real_t derivative = 0.0;
+            for (int dn = 0; dn < D1D; ++dn)
+            {
+               const int e0 = normal_direction == 0 ? dn :
+                              tangent1 == 0 ? d1 : d2;
+               const int e1 = normal_direction == 1 ? dn :
+                              tangent1 == 1 ? d1 : d2;
+               const int e2 = normal_direction == 2 ? dn :
+                              tangent1 == 2 ? d1 : d2;
+               const real_t x = element_x(
+                  e0, e1, e2, dim * history + component, element);
+               value += normal_basis(dn, level) * x;
+               derivative += normal_derivative(dn, level) * x;
+            }
+            face_value[d2][d1] = value;
+            face_normal_derivative[d2][d1] = derivative;
+         }
+      }
+
+      real_t value_t1[max_D1D][max_Q1D];
+      real_t derivative_t1[max_D1D][max_Q1D];
+      real_t normal_t1[max_D1D][max_Q1D];
+      for (int d2 = 0; d2 < D1D; ++d2)
+      {
+         for (int q1 = 0; q1 < Q1D; ++q1)
+         {
+            real_t value = 0.0;
+            real_t derivative = 0.0;
+            real_t normal = 0.0;
+            for (int d1 = 0; d1 < D1D; ++d1)
+            {
+               value += B(q1, d1) * face_value[d2][d1];
+               derivative += G(q1, d1) * face_value[d2][d1];
+               normal += B(q1, d1) * face_normal_derivative[d2][d1];
+            }
+            value_t1[d2][q1] = value;
+            derivative_t1[d2][q1] = derivative;
+            normal_t1[d2][q1] = normal;
+         }
+      }
+
+      for (int q2 = 0; q2 < Q1D; ++q2)
+      {
+         for (int q1 = 0; q1 < Q1D; ++q1)
+         {
+            real_t reference_gradient[3] = {0.0, 0.0, 0.0};
+            for (int d2 = 0; d2 < D1D; ++d2)
+            {
+               reference_gradient[normal_direction] +=
+                  B(q2, d2) * normal_t1[d2][q1];
+               reference_gradient[tangent1] +=
+                  B(q2, d2) * derivative_t1[d2][q1];
+               reference_gradient[tangent2] +=
+                  G(q2, d2) * value_t1[d2][q1];
+            }
+            const int q = q1 + Q1D * q2;
+            real_t directional_derivative = 0.0;
+            for (int physical = 0; physical < dim; ++physical)
+            {
+               real_t gradient = 0.0;
+               for (int reference = 0; reference < dim; ++reference)
+               {
+                  gradient += reference_gradient[reference] *
+                              inverse_jacobian(reference, physical, q, face);
+               }
+               const real_t relative =
+                  state(q1, q2, dim * history + physical, 0, face) -
+                  state(q1, q2, dim * history_order + physical, 0, face);
+               directional_derivative += gradient * relative;
+            }
+            acceleration(q1, q2, component, history, face) =
+               directional_derivative;
+         }
+      }
+   });
+}
+
 static void PAALEPressureBoundaryApply3D(
    const int history_order, const bool continuity_scratch,
    const int d1d, const int q1d, const int nf, const int ne,
    const Array<real_t> &weights, const DofToQuad &maps,
    const Vector &determinants, const Vector &normals,
-   const Vector &basis_, const Vector &derivative_,
-   const Vector &inverse_jacobian_, const Array<int> &boundary_elements,
-   const Vector &delta_weights, const Vector &face_x_,
-   const Vector &element_x_, Vector &face_y_,
-   const int *attributes = nullptr, const int *marker = nullptr,
-   const int marker_size = 0)
+   const Vector &normal_basis, const Vector &normal_derivative,
+   const Vector &inverse_jacobian, const Array<int> &boundary_elements,
+   const Array<int> &boundary_face_ids, const Vector &delta_weights,
+   const Vector &state, const Vector &element_x, Vector &acceleration,
+   Vector &face_y_, const int *attributes = nullptr,
+   const int *marker = nullptr, const int marker_size = 0)
 {
    MFEM_VERIFY(d1d <= ALE_FACE_MAX_D1D && q1d <= ALE_FACE_MAX_Q1D,
                "ALE pressure-boundary PA face size exceeds the configured limit");
+   if (d1d == 7 && q1d == 8)
+   {
+      PAALEPressureAcceleration3D<7, 8>(
+         history_order, continuity_scratch, d1d, q1d, nf, ne, maps,
+         normal_basis, normal_derivative, inverse_jacobian,
+         boundary_elements, boundary_face_ids, state, element_x, acceleration,
+         attributes, marker, marker_size);
+   }
+   else if (d1d == 3 && q1d == 4)
+   {
+      PAALEPressureAcceleration3D<3, 4>(
+         history_order, continuity_scratch, d1d, q1d, nf, ne, maps,
+         normal_basis, normal_derivative, inverse_jacobian,
+         boundary_elements, boundary_face_ids, state, element_x, acceleration,
+         attributes, marker, marker_size);
+   }
+   else
+   {
+      PAALEPressureAcceleration3D<>(
+         history_order, continuity_scratch, d1d, q1d, nf, ne, maps,
+         normal_basis, normal_derivative, inverse_jacobian,
+         boundary_elements, boundary_face_ids, state, element_x, acceleration,
+         attributes, marker, marker_size);
+   }
+
    const int dim = 3;
    const int vdim = dim * (history_order + 1 + (continuity_scratch ? 1 : 0));
-   const int nq = q1d * q1d;
-   auto B = Reshape(maps.B.Read(), q1d, d1d);
    auto Bt = Reshape(maps.Bt.Read(), d1d, q1d);
    auto det = Reshape(determinants.Read(), q1d, q1d, nf);
    auto normal = Reshape(normals.Read(), q1d, q1d, dim, nf);
-   auto basis = Reshape(basis_.Read(), d1d, dim, nq, nf);
-   auto derivative = Reshape(derivative_.Read(), d1d, dim, nq, nf);
-   auto inverse_jacobian =
-      Reshape(inverse_jacobian_.Read(), dim, dim, nq, nf);
-   auto elements = boundary_elements.Read();
    auto delta = delta_weights.Read();
    auto weight = weights.Read();
-   auto face_x = Reshape(face_x_.Read(), d1d, d1d, vdim, 2, nf);
-   auto element_x =
-      Reshape(element_x_.Read(), d1d, d1d, d1d, vdim, ne);
+   auto convective_acceleration =
+      Reshape(acceleration.Read(), q1d, q1d, dim, history_order, nf);
    auto face_y = Reshape(face_y_.ReadWrite(), d1d, d1d, vdim, 2, nf);
 
    mfem::forall(nf, [=] MFEM_HOST_DEVICE(int face)
@@ -1016,96 +1171,49 @@ static void PAALEPressureBoundaryApply3D(
              marker[attribute - 1] == 0) { return; }
       }
       real_t flux[ALE_FACE_MAX_Q1D][ALE_FACE_MAX_Q1D];
-      const int element = elements[face];
       for (int q2 = 0; q2 < q1d; ++q2)
       {
          for (int q1 = 0; q1 < q1d; ++q1)
          {
             const int q = q1 + q1d * q2;
-            real_t state[15];
-            for (int component = 0; component < vdim; ++component)
-            {
-               state[component] = 0.0;
-               for (int d2 = 0; d2 < d1d; ++d2)
-               {
-                  for (int d1 = 0; d1 < d1d; ++d1)
-                  {
-                     state[component] += B(q1, d1) * B(q2, d2) *
-                        face_x(d1, d2, component, 0, face);
-                  }
-               }
-            }
             real_t pressure = 0.0;
             for (int history = 0; history < history_order; ++history)
             {
-               real_t acceleration[3] = {0.0, 0.0, 0.0};
-               real_t relative[3] = {0.0, 0.0, 0.0};
-               for (int direction = 0; direction < dim; ++direction)
-               {
-                  relative[direction] =
-                     state[dim * history + direction] -
-                     state[dim * history_order + direction];
-               }
-               for (int component = 0; component < dim; ++component)
-               {
-                  for (int physical = 0; physical < dim; ++physical)
-                  {
-                     real_t gradient = 0.0;
-                     for (int d3 = 0; d3 < d1d; ++d3)
-                     {
-                        for (int d2 = 0; d2 < d1d; ++d2)
-                        {
-                           for (int d1 = 0; d1 < d1d; ++d1)
-                           {
-                              const real_t reference0 =
-                                 derivative(d1, 0, q, face) *
-                                 basis(d2, 1, q, face) *
-                                 basis(d3, 2, q, face);
-                              const real_t reference1 =
-                                 basis(d1, 0, q, face) *
-                                 derivative(d2, 1, q, face) *
-                                 basis(d3, 2, q, face);
-                              const real_t reference2 =
-                                 basis(d1, 0, q, face) *
-                                 basis(d2, 1, q, face) *
-                                 derivative(d3, 2, q, face);
-                              const real_t physical_derivative =
-                                 reference0 * inverse_jacobian(0, physical, q, face) +
-                                 reference1 * inverse_jacobian(1, physical, q, face) +
-                                 reference2 * inverse_jacobian(2, physical, q, face);
-                              gradient += element_x(
-                                 d1, d2, d3, dim * history + component,
-                                 element) * physical_derivative;
-                           }
-                        }
-                     }
-                     acceleration[component] += gradient * relative[physical];
-                  }
-               }
                real_t normal_acceleration = 0.0;
                for (int component = 0; component < dim; ++component)
                {
-                  normal_acceleration += acceleration[component] *
-                                         normal(q1, q2, component, face);
+                  normal_acceleration +=
+                     convective_acceleration(q1, q2, component, history, face) *
+                     normal(q1, q2, component, face);
                }
                pressure += delta[history] * normal_acceleration;
             }
             flux[q1][q2] = weight[q] * det(q1, q2, face) * pressure;
          }
       }
+      real_t projected[ALE_FACE_MAX_D1D][ALE_FACE_MAX_Q1D];
+      for (int d2 = 0; d2 < d1d; ++d2)
+      {
+         for (int q1 = 0; q1 < q1d; ++q1)
+         {
+            real_t value = 0.0;
+            for (int q2 = 0; q2 < q1d; ++q2)
+            {
+               value += Bt(d2, q2) * flux[q1][q2];
+            }
+            projected[d2][q1] = value;
+         }
+      }
       for (int d2 = 0; d2 < d1d; ++d2)
       {
          for (int d1 = 0; d1 < d1d; ++d1)
          {
-            real_t load = 0.0;
-            for (int q2 = 0; q2 < q1d; ++q2)
+            real_t value = 0.0;
+            for (int q1 = 0; q1 < q1d; ++q1)
             {
-               for (int q1 = 0; q1 < q1d; ++q1)
-               {
-                  load += Bt(d1, q1) * Bt(d2, q2) * flux[q1][q2];
-               }
+               value += Bt(d1, q1) * projected[d2][q1];
             }
-            face_y(d1, d2, dim, 0, face) += load;
+            face_y(d1, d2, dim, 0, face) += value;
          }
       }
    });
@@ -1639,10 +1747,14 @@ void ALEConvectionBoundaryIntegrator::AssemblePABoundaryFaces(
    MFEM_VERIFY(ir->GetNPoints() == (dim == 2 ? quad1D : quad1D * quad1D),
                "ALE boundary PA requires a tensor-product face rule");
 
-   if (include_convection)
+   if (dim == 3 && (include_convection || include_pressure_delta))
    {
       pa_state.SetSize(nq * expected_vdim * 2 * nf, memory);
-      pa_flux.SetSize(nq * dim * 2 * nf, memory);
+   }
+
+   if (include_convection)
+   {
+      if (dim == 3) { pa_flux.SetSize(nq * dim * 2 * nf, memory); }
       CoefficientVector sampled_datum(
          *datum, quadrature, CoefficientStorage::COMPRESSED);
       pa_datum.SetSize(sampled_datum.Size(), memory);
@@ -1656,19 +1768,50 @@ void ALEConvectionBoundaryIntegrator::AssemblePABoundaryFaces(
                    dofs1D * dofs1D * dofs1D),
                   "ALE pressure-boundary PA requires tensor-product elements");
       pa_boundary_elements.SetSize(nf, memory);
-      pa_basis.SetSize(dofs1D * dim * nq * nf, memory);
-      pa_derivative.SetSize(dofs1D * dim * nq * nf, memory);
       pa_inverse_jacobian.SetSize(dim * dim * nq * nf, memory);
+      if (dim == 2)
+      {
+         pa_basis.SetSize(dofs1D * dim * nq * nf, memory);
+         pa_derivative.SetSize(dofs1D * dim * nq * nf, memory);
+      }
+      else
+      {
+         pa_boundary_face_ids.SetSize(nf, memory);
+         pa_normal_basis.SetSize(dofs1D * 2, memory);
+         pa_normal_derivative.SetSize(dofs1D * 2, memory);
+         pa_acceleration.SetSize(nq * dim * history_order * nf, memory);
+      }
 
       auto boundary_elements = pa_boundary_elements.HostWrite();
-      auto basis_data = Reshape(pa_basis.HostWrite(), dofs1D, dim, nq, nf);
-      auto derivative_data =
-         Reshape(pa_derivative.HostWrite(), dofs1D, dim, nq, nf);
       auto inverse_data =
          Reshape(pa_inverse_jacobian.HostWrite(), dim, dim, nq, nf);
       Poly_1D::Basis &basis1d =
          poly1d.GetBasis(dofs1D - 1, BasisType::GaussLobatto);
       Vector values(dofs1D), derivatives(dofs1D);
+      real_t *basis_data_ptr = dim == 2 ? pa_basis.HostWrite() : nullptr;
+      real_t *derivative_data_ptr =
+         dim == 2 ? pa_derivative.HostWrite() : nullptr;
+      auto basis_data = Reshape(basis_data_ptr, dofs1D, dim, nq, nf);
+      auto derivative_data =
+         Reshape(derivative_data_ptr, dofs1D, dim, nq, nf);
+      int *face_ids = dim == 3 ? pa_boundary_face_ids.HostWrite() : nullptr;
+
+      if (dim == 3)
+      {
+         auto normal_basis =
+            Reshape(pa_normal_basis.HostWrite(), dofs1D, 2);
+         auto normal_derivative =
+            Reshape(pa_normal_derivative.HostWrite(), dofs1D, 2);
+         for (int level = 0; level < 2; ++level)
+         {
+            basis1d.Eval(real_t(level), values, derivatives);
+            for (int dof = 0; dof < dofs1D; ++dof)
+            {
+               normal_basis(dof, level) = values(dof);
+               normal_derivative(dof, level) = derivatives(dof);
+            }
+         }
+      }
 
       for (int face = 0; face < nf; ++face)
       {
@@ -1676,6 +1819,10 @@ void ALEConvectionBoundaryIntegrator::AssemblePABoundaryFaces(
          const Mesh::FaceInformation information =
             mesh->GetFaceInformation(mesh_face);
          boundary_elements[face] = information.element[0].index;
+         if (face_ids)
+         {
+            face_ids[face] = information.element[0].local_face_id;
+         }
          FaceElementTransformations *transformation =
             mesh->GetFaceElementTransformations(mesh_face);
          MFEM_VERIFY(transformation && transformation->Elem2No < 0,
@@ -1692,14 +1839,17 @@ void ALEConvectionBoundaryIntegrator::AssemblePABoundaryFaces(
             {
                element_ip.x, element_ip.y, element_ip.z
             };
-            for (int direction = 0; direction < dim; ++direction)
+            if (dim == 2)
             {
-               basis1d.Eval(coordinate[direction], values, derivatives);
-               for (int dof = 0; dof < dofs1D; ++dof)
+               for (int direction = 0; direction < dim; ++direction)
                {
-                  basis_data(dof, direction, lex_point, face) = values(dof);
-                  derivative_data(dof, direction, lex_point, face) =
-                     derivatives(dof);
+                  basis1d.Eval(coordinate[direction], values, derivatives);
+                  for (int dof = 0; dof < dofs1D; ++dof)
+                  {
+                     basis_data(dof, direction, lex_point, face) = values(dof);
+                     derivative_data(dof, direction, lex_point, face) =
+                        derivatives(dof);
+                  }
                }
             }
             transformation->Elem1->SetIntPoint(&element_ip);
@@ -1751,8 +1901,10 @@ void ALEConvectionBoundaryIntegrator::AddMultPAFace(
    if (nf == 0 || !include_pressure_delta) { return; }
    MFEM_VERIFY(delta->Size() == history_order,
                "ALE pressure weights changed size after construction");
-   MFEM_VERIFY(pa_basis.Size() && pa_derivative.Size() &&
-               pa_inverse_jacobian.Size(),
+   MFEM_VERIFY(pa_inverse_jacobian.Size() &&
+               (dim == 2 ? pa_basis.Size() && pa_derivative.Size() :
+                pa_normal_basis.Size() && pa_normal_derivative.Size() &&
+                pa_boundary_face_ids.Size() && pa_acceleration.Size()),
                "assemble the ALE pressure-boundary PA kernel before applying it");
    const IntegrationRule &ir = *IntRule;
    if (dim == 2)
@@ -1766,12 +1918,39 @@ void ALEConvectionBoundaryIntegrator::AddMultPAFace(
    }
    else
    {
+      if (!include_convection)
+      {
+         if (dofs1D == 7 && quad1D == 8)
+         {
+            PAALEFaceEvaluate3D<7, 8>(
+               dofs1D, quad1D, nf,
+               dim * (history_order + 1 +
+                      (include_continuity_scratch ? 1 : 0)),
+               *maps, face_x, pa_state);
+         }
+         else if (dofs1D == 3 && quad1D == 4)
+         {
+            PAALEFaceEvaluate3D<3, 4>(
+               dofs1D, quad1D, nf,
+               dim * (history_order + 1 +
+                      (include_continuity_scratch ? 1 : 0)),
+               *maps, face_x, pa_state);
+         }
+         else
+         {
+            PAALEFaceEvaluate3D<>(
+               dofs1D, quad1D, nf,
+               dim * (history_order + 1 +
+                      (include_continuity_scratch ? 1 : 0)),
+               *maps, face_x, pa_state);
+         }
+      }
       PAALEPressureBoundaryApply3D(
          history_order, include_continuity_scratch,
          dofs1D, quad1D, nf, ne, ir.GetWeights(), *maps,
-         geom->detJ, geom->normal, pa_basis, pa_derivative,
-         pa_inverse_jacobian, pa_boundary_elements, *delta,
-         face_x, element_x, face_y);
+         geom->detJ, geom->normal, pa_normal_basis, pa_normal_derivative,
+         pa_inverse_jacobian, pa_boundary_elements, pa_boundary_face_ids,
+         *delta, pa_state, element_x, pa_acceleration, face_y);
    }
 }
 
@@ -1814,8 +1993,10 @@ void ALEConvectionBoundaryIntegrator::AddMultPAFace(
    if (nf == 0 || !include_pressure_delta) { return; }
    MFEM_VERIFY(delta->Size() == history_order,
                "ALE pressure weights changed size after construction");
-   MFEM_VERIFY(pa_basis.Size() && pa_derivative.Size() &&
-               pa_inverse_jacobian.Size(),
+   MFEM_VERIFY(pa_inverse_jacobian.Size() &&
+               (dim == 2 ? pa_basis.Size() && pa_derivative.Size() :
+                pa_normal_basis.Size() && pa_normal_derivative.Size() &&
+                pa_boundary_face_ids.Size() && pa_acceleration.Size()),
                "assemble the ALE pressure-boundary PA kernel before applying it");
    if (dim == 2)
    {
@@ -1828,12 +2009,36 @@ void ALEConvectionBoundaryIntegrator::AddMultPAFace(
    }
    else
    {
+      if (!include_convection)
+      {
+         const int vdim = dim *
+            (history_order + 1 + (include_continuity_scratch ? 1 : 0));
+         if (dofs1D == 7 && quad1D == 8)
+         {
+            PAALEFaceEvaluate3D<7, 8>(
+               dofs1D, quad1D, nf, vdim, *maps, face_x, pa_state,
+               attributes, enabled, marker_size);
+         }
+         else if (dofs1D == 3 && quad1D == 4)
+         {
+            PAALEFaceEvaluate3D<3, 4>(
+               dofs1D, quad1D, nf, vdim, *maps, face_x, pa_state,
+               attributes, enabled, marker_size);
+         }
+         else
+         {
+            PAALEFaceEvaluate3D<>(
+               dofs1D, quad1D, nf, vdim, *maps, face_x, pa_state,
+               attributes, enabled, marker_size);
+         }
+      }
       PAALEPressureBoundaryApply3D(
          history_order, include_continuity_scratch,
          dofs1D, quad1D, nf, ne, ir.GetWeights(), *maps,
-         geom->detJ, geom->normal, pa_basis, pa_derivative,
-         pa_inverse_jacobian, pa_boundary_elements, *delta,
-         face_x, element_x, face_y, attributes, enabled, marker_size);
+         geom->detJ, geom->normal, pa_normal_basis, pa_normal_derivative,
+         pa_inverse_jacobian, pa_boundary_elements, pa_boundary_face_ids,
+         *delta, pa_state, element_x, pa_acceleration, face_y,
+         attributes, enabled, marker_size);
    }
 }
 

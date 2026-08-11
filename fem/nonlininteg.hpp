@@ -273,10 +273,14 @@ private:
    const FaceGeometricFactors *geom = nullptr;
    mutable Vector pa_state;
    mutable Vector pa_flux;
+   mutable Vector pa_acceleration;
    Vector pa_datum;
    Array<int> pa_boundary_elements;
+   Array<int> pa_boundary_face_ids;
    Vector pa_basis;
    Vector pa_derivative;
+   Vector pa_normal_basis;
+   Vector pa_normal_derivative;
    Vector pa_inverse_jacobian;
 
    Vector shape, normal, datum_value;

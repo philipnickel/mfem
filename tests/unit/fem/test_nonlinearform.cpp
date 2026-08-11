@@ -295,7 +295,11 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
 {
    const int dim = GENERATE(2, 3);
    const bool use_constant_datum = GENERATE(false, true);
-   INFO("dim=" << dim << ", constant datum=" << use_constant_datum);
+   const bool all_attributes = GENERATE(false, true);
+   const bool include_convection = GENERATE(false, true);
+   INFO("dim=" << dim << ", constant datum=" << use_constant_datum
+        << ", all attributes=" << all_attributes
+        << ", convection=" << include_convection);
    const int degree = GENERATE(2, 6);
    const int history_order = 2;
    Mesh mesh = dim == 2 ?
@@ -329,7 +333,7 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
                               static_cast<VectorCoefficient&>(constant_datum) :
                               static_cast<VectorCoefficient&>(variable_datum);
    Array<int> marker(mesh.bdr_attributes.Max());
-   marker = 0;
+   marker = all_attributes ? 1 : 0;
    marker[0] = 1;
    const Geometry::Type face_geometry =
       dim == 2 ? Geometry::SEGMENT : Geometry::SQUARE;
@@ -338,14 +342,14 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
 
    NonlinearForm legacy(&fes);
    auto *legacy_integrator = new ALEConvectionBoundaryIntegrator(
-      history_order, 0.9, beta, delta, true, true);
+      history_order, 0.9, beta, delta, include_convection, true);
    legacy_integrator->SetDatum(datum);
    legacy_integrator->SetIntRule(&rule);
    legacy.AddBdrFaceIntegrator(legacy_integrator, marker);
 
    NonlinearForm partial(&fes);
    auto *partial_integrator = new ALEConvectionBoundaryIntegrator(
-      history_order, 0.9, beta, delta, true, true);
+      history_order, 0.9, beta, delta, include_convection, true);
    partial_integrator->SetDatum(datum);
    partial_integrator->SetIntRule(&rule);
    partial.AddBdrFaceIntegrator(partial_integrator, marker);
