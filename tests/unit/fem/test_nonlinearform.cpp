@@ -192,6 +192,7 @@ TEST_CASE("ALE volume partial assembly matches legacy",
                             false, 2.0, 1.0) :
       Mesh::MakeCartesian3D(2, 1, 1, Element::HEXAHEDRON,
                             2.0, 1.0, 1.0);
+   mesh.SetCurvature(degree, false, dim, Ordering::byNODES);
    L2_FECollection fec(degree, dim, BasisType::GaussLobatto);
    FiniteElementSpace fes(&mesh, &fec, dim * (history_order + 1),
                           Ordering::byNODES);
@@ -233,6 +234,15 @@ TEST_CASE("ALE volume partial assembly matches legacy",
    partial_load -= legacy_load;
    REQUIRE(partial_load.Normlinf() <=
            1e-12 * (1.0 + legacy_load.Normlinf()));
+
+   (*mesh.GetNodes()) *= 1.03;
+   mesh.NodesUpdated();
+   partial.Setup();
+   legacy.Mult(state, legacy_load);
+   partial.Mult(state, partial_load);
+   partial_load -= legacy_load;
+   REQUIRE(partial_load.Normlinf() <=
+           1e-12 * (1.0 + legacy_load.Normlinf()));
 }
 
 TEST_CASE("ALE interior partial assembly matches legacy",
@@ -246,6 +256,7 @@ TEST_CASE("ALE interior partial assembly matches legacy",
                             false, 2.0, 1.0) :
       Mesh::MakeCartesian3D(2, 1, 1, Element::HEXAHEDRON,
                             2.0, 1.0, 1.0);
+   mesh.SetCurvature(degree, false, dim, Ordering::byNODES);
    L2_FECollection fec(degree, dim, BasisType::GaussLobatto);
    FiniteElementSpace fes(&mesh, &fec, dim * (history_order + 1),
                           Ordering::byNODES);
@@ -288,6 +299,15 @@ TEST_CASE("ALE interior partial assembly matches legacy",
    partial_load -= legacy_load;
    REQUIRE(partial_load.Normlinf() <=
            1e-12 * (1.0 + legacy_load.Normlinf()));
+
+   (*mesh.GetNodes()) *= 1.03;
+   mesh.NodesUpdated();
+   partial.Setup();
+   legacy.Mult(state, legacy_load);
+   partial.Mult(state, partial_load);
+   partial_load -= legacy_load;
+   REQUIRE(partial_load.Normlinf() <=
+           1e-12 * (1.0 + legacy_load.Normlinf()));
 }
 
 TEST_CASE("ALE boundary partial assembly matches legacy",
@@ -307,6 +327,7 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
                             false, 2.0, 1.0) :
       Mesh::MakeCartesian3D(2, 1, 1, Element::HEXAHEDRON,
                             2.0, 1.0, 1.0);
+   mesh.SetCurvature(degree, false, dim, Ordering::byNODES);
    L2_FECollection fec(degree, dim, BasisType::GaussLobatto);
    FiniteElementSpace fes(&mesh, &fec, dim * (history_order + 1),
                           Ordering::byNODES);
@@ -369,6 +390,15 @@ TEST_CASE("ALE boundary partial assembly matches legacy",
    beta(1) = 1.2;
    delta(0) = -0.25;
    delta(1) = 0.65;
+   legacy.Mult(state, legacy_load);
+   partial.Mult(state, partial_load);
+   partial_load -= legacy_load;
+   REQUIRE(partial_load.Normlinf() <=
+           1e-12 * (1.0 + legacy_load.Normlinf()));
+
+   (*mesh.GetNodes()) *= 1.03;
+   mesh.NodesUpdated();
+   partial.Setup();
    legacy.Mult(state, legacy_load);
    partial.Mult(state, partial_load);
    partial_load -= legacy_load;

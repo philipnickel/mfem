@@ -36,6 +36,7 @@ PANonlinearFormExtension::PANonlinearFormExtension(const NonlinearForm *nlf):
    int_face_restriction(nullptr),
    bdr_face_restriction(nullptr),
    bdr_face_attributes(nullptr),
+   assembled(false),
    Grad(*this)
 {
    elemR = fes.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
@@ -64,6 +65,29 @@ real_t PANonlinearFormExtension::GetGridFunctionEnergy(const Vector &x) const
 
 void PANonlinearFormExtension::Assemble()
 {
+   if (assembled)
+   {
+      for (int i = 0; i < dnfi.Size(); ++i) { dnfi[i]->UpdatePA(fes); }
+      for (int i = 0; i < fnfi.Size(); ++i)
+      {
+         fnfi[i]->UpdatePAInteriorFaces(fes);
+      }
+      for (int i = 0; i < bfnfi.Size(); ++i)
+      {
+         const Array<int> *marker = bfnfi_marker[i];
+         if (marker)
+         {
+            bfnfi[i]->UpdatePABoundaryFaces(
+               fes, *bdr_face_attributes, *marker);
+         }
+         else
+         {
+            bfnfi[i]->UpdatePABoundaryFaces(fes);
+         }
+      }
+      return;
+   }
+
    for (int i = 0; i < dnfi.Size(); ++i) { dnfi[i]->AssemblePA(fes); }
 
    if (fnfi.Size())
@@ -78,7 +102,6 @@ void PANonlinearFormExtension::Assemble()
          fnfi[i]->AssemblePAInteriorFaces(fes);
       }
    }
-
    if (bfnfi.Size())
    {
       bdr_face_restriction = fes.GetFaceRestriction(
@@ -94,6 +117,7 @@ void PANonlinearFormExtension::Assemble()
          bfnfi[i]->AssemblePABoundaryFaces(fes);
       }
    }
+   assembled = true;
 }
 
 void PANonlinearFormExtension::Mult(const Vector &x, Vector &y) const
@@ -175,6 +199,7 @@ void PANonlinearFormExtension::Update()
    int_face_restriction = nullptr;
    bdr_face_restriction = nullptr;
    bdr_face_attributes = nullptr;
+   assembled = false;
    xe.SetSize(elemR->Height());
    ye.SetSize(elemR->Height());
    int_face_x.SetSize(0);

@@ -105,6 +105,26 @@ public:
    /// Method defining partial assembly on boundary faces.
    virtual void AssemblePABoundaryFaces(const FiniteElementSpace &fes);
 
+   /** @brief Refresh partial-assembly data after coefficients or geometry
+       change without requiring the form topology to be rebuilt. */
+   virtual void UpdatePA(const FiniteElementSpace &fes)
+   { AssemblePA(fes); }
+
+   /// Refresh partial-assembly data on interior faces.
+   virtual void UpdatePAInteriorFaces(const FiniteElementSpace &fes)
+   { AssemblePAInteriorFaces(fes); }
+
+   /// Refresh partial-assembly data on boundary faces.
+   virtual void UpdatePABoundaryFaces(const FiniteElementSpace &fes)
+   { AssemblePABoundaryFaces(fes); }
+
+   /** @brief Refresh boundary-face PA data for an attribute marker.
+       The default preserves the generic full-update behavior. */
+   virtual void UpdatePABoundaryFaces(
+      const FiniteElementSpace &fes, const Array<int> &face_attributes,
+      const Array<int> &marker)
+   { UpdatePABoundaryFaces(fes); }
+
    /** @brief Prepare the integrator for partial assembly (PA) gradient
        evaluations on the given FE space @a fes at the state @a x. */
    /** The result of the partial assembly is stored internally so that it can be
@@ -224,6 +244,8 @@ public:
 
    void AssemblePA(const FiniteElementSpace &fes) override;
 
+   void UpdatePA(const FiniteElementSpace &fes) override;
+
    void AddMultPA(const Vector &x, Vector &y) const override;
 };
 
@@ -283,6 +305,10 @@ private:
    Vector pa_normal_derivative;
    Vector pa_inverse_jacobian;
 
+   void UpdatePABoundaryFacesImpl(
+      const FiniteElementSpace &fes, const Array<int> *face_attributes,
+      const Array<int> *marker);
+
    Vector shape, normal, datum_value;
    DenseMatrix dshape;
 
@@ -303,6 +329,12 @@ public:
                            Vector &elvect) override;
 
    void AssemblePABoundaryFaces(const FiniteElementSpace &fes) override;
+
+   void UpdatePABoundaryFaces(const FiniteElementSpace &fes) override;
+
+   void UpdatePABoundaryFaces(
+      const FiniteElementSpace &fes, const Array<int> &face_attributes,
+      const Array<int> &marker) override;
 
    void AddMultPA(const Vector &x, Vector &y) const override;
 
@@ -371,6 +403,8 @@ public:
                            Vector &elvect) override;
 
    void AssemblePAInteriorFaces(const FiniteElementSpace &fes) override;
+
+   void UpdatePAInteriorFaces(const FiniteElementSpace &fes) override;
 
    void AddMultPA(const Vector &x, Vector &y) const override;
 };

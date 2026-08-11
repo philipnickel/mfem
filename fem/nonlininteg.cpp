@@ -1332,6 +1332,15 @@ void ALEConvectionVolumeIntegrator::AssemblePA(
    pa_flux.SetSize(nq * dim * ne, memory);
 }
 
+void ALEConvectionVolumeIntegrator::UpdatePA(
+   const FiniteElementSpace &fes)
+{
+   const MemoryType memory =
+      pa_mt == MemoryType::DEFAULT ? Device::GetDeviceMemoryType() : pa_mt;
+   geom = fes.GetMesh()->GetGeometricFactors(
+             *IntRule, GeometricFactors::JACOBIANS, memory);
+}
+
 void ALEConvectionVolumeIntegrator::AddMultPA(
    const Vector &x, Vector &y) const
 {
@@ -1523,6 +1532,19 @@ void ALEConvectionInteriorIntegrator::AssemblePAInteriorFaces(
    const int vdim = dim * (history_order + 1);
    pa_state.SetSize(face_nq * vdim * 2 * nf, memory);
    pa_flux.SetSize(face_nq * dim * 2 * nf, memory);
+}
+
+void ALEConvectionInteriorIntegrator::UpdatePAInteriorFaces(
+   const FiniteElementSpace &fes)
+{
+   if (nf == 0) { return; }
+   const MemoryType memory =
+      pa_mt == MemoryType::DEFAULT ? Device::GetDeviceMemoryType() : pa_mt;
+   geom = fes.GetMesh()->GetFaceGeometricFactors(
+             *IntRule,
+             FaceGeometricFactors::DETERMINANTS |
+             FaceGeometricFactors::NORMALS,
+             FaceType::Interior, memory);
 }
 
 void ALEConvectionInteriorIntegrator::AddMultPA(
@@ -1866,6 +1888,95 @@ void ALEConvectionBoundaryIntegrator::AssemblePABoundaryFaces(
          }
       }
    }
+}
+
+void ALEConvectionBoundaryIntegrator::UpdatePABoundaryFacesImpl(
+   const FiniteElementSpace &fes, const Array<int> *face_attributes,
+   const Array<int> *marker)
+{
+   if (nf == 0) { return; }
+   MFEM_VERIFY((face_attributes == nullptr) == (marker == nullptr),
+               "ALE boundary update requires both attributes and marker");
+   if (face_attributes)
+   {
+      MFEM_VERIFY(face_attributes->Size() == nf,
+                  "ALE boundary attributes do not match the PA face layout");
+   }
+
+   Mesh *mesh = fes.GetMesh();
+   const MemoryType memory =
+      pa_mt == MemoryType::DEFAULT ? Device::GetDeviceMemoryType() : pa_mt;
+   geom = mesh->GetFaceGeometricFactors(
+             *IntRule,
+             FaceGeometricFactors::DETERMINANTS |
+             FaceGeometricFactors::NORMALS,
+             FaceType::Boundary, memory);
+   FaceQuadratureSpace quadrature(*mesh, *IntRule, FaceType::Boundary);
+
+   if (include_convection)
+   {
+      CoefficientVector sampled_datum(
+         *datum, quadrature, CoefficientStorage::COMPRESSED);
+      MFEM_VERIFY(sampled_datum.Size() == pa_datum.Size(),
+                  "ALE boundary datum size changed without a topology update");
+      pa_datum = sampled_datum;
+   }
+
+   if (!include_pressure_delta) { return; }
+   const int *attributes = face_attributes ? face_attributes->HostRead() : nullptr;
+   const int *enabled = marker ? marker->HostRead() : nullptr;
+   const int marker_size = marker ? marker->Size() : 0;
+   auto inverse_data =
+      Reshape(pa_inverse_jacobian.HostWrite(), dim, dim, nq, nf);
+   for (int face = 0; face < nf; ++face)
+   {
+      if (attributes)
+      {
+         const int attribute = attributes[face];
+         if (attribute <= 0 || attribute > marker_size ||
+             enabled[attribute - 1] == 0) { continue; }
+      }
+      const int mesh_face = quadrature.GetMeshFaceIndex(face);
+      const Mesh::FaceInformation information =
+         mesh->GetFaceInformation(mesh_face);
+      FaceElementTransformations *transformation =
+         mesh->GetFaceElementTransformations(mesh_face);
+      MFEM_VERIFY(transformation && transformation->Elem2No < 0,
+                  "ALE boundary quadrature contains a non-boundary face");
+      for (int point = 0; point < nq; ++point)
+      {
+         const int lex_point = ToLexOrdering(
+            dim, information.element[0].local_face_id, quad1D, point);
+         const IntegrationPoint &face_ip = IntRule->IntPoint(point);
+         transformation->SetAllIntPoints(&face_ip);
+         const IntegrationPoint &element_ip =
+            transformation->GetElement1IntPoint();
+         transformation->Elem1->SetIntPoint(&element_ip);
+         const DenseMatrix &inverse =
+            transformation->Elem1->InverseJacobian();
+         for (int reference = 0; reference < dim; ++reference)
+         {
+            for (int physical = 0; physical < dim; ++physical)
+            {
+               inverse_data(reference, physical, lex_point, face) =
+                  inverse(reference, physical);
+            }
+         }
+      }
+   }
+}
+
+void ALEConvectionBoundaryIntegrator::UpdatePABoundaryFaces(
+   const FiniteElementSpace &fes)
+{
+   UpdatePABoundaryFacesImpl(fes, nullptr, nullptr);
+}
+
+void ALEConvectionBoundaryIntegrator::UpdatePABoundaryFaces(
+   const FiniteElementSpace &fes, const Array<int> &face_attributes,
+   const Array<int> &marker)
+{
+   UpdatePABoundaryFacesImpl(fes, &face_attributes, &marker);
 }
 
 void ALEConvectionBoundaryIntegrator::AddMultPA(

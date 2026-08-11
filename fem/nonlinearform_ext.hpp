@@ -101,6 +101,7 @@ protected:
    const FaceRestriction *int_face_restriction; // not owned
    const FaceRestriction *bdr_face_restriction; // not owned
    const Array<int> *bdr_face_attributes; // not owned
+   bool assembled;
    mutable Gradient Grad;
 
 public:
