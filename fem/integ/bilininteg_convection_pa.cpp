@@ -57,6 +57,37 @@ ConvectionIntegrator::Kernels::Kernels()
    ConvectionIntegrator::AddSpecialization<3, 6, 7>();
 }
 
+static void PAConvectionSetup1D(const int SDIM,
+                                const int NQ,
+                                const int NE,
+                                const Array<real_t> &w,
+                                const Vector &j,
+                                const Vector &vel,
+                                const real_t alpha,
+                                Vector &op)
+{
+   const bool const_v = vel.Size() == SDIM;
+   const auto W = w.Read();
+   const auto J = Reshape(j.Read(), NQ,SDIM,NE);
+   const auto V = const_v ? Reshape(vel.Read(), SDIM,1,1)
+                          : Reshape(vel.Read(), SDIM,NQ,NE);
+   auto y = Reshape(op.Write(), NQ,NE);
+   mfem::forall(NE*NQ, [=] MFEM_HOST_DEVICE (int q_global)
+   {
+      const int e = q_global / NQ;
+      const int q = q_global % NQ;
+      real_t tangent2 = 0.0;
+      real_t transport = 0.0;
+      for (int d = 0; d < SDIM; d++)
+      {
+         const real_t tangent = J(q,d,e);
+         tangent2 += tangent * tangent;
+         transport += tangent * (const_v ? V(d,0,0) : V(d,q,e));
+      }
+      y(q,e) = alpha * W[q] * transport / std::sqrt(tangent2);
+   });
+}
+
 // PA Convection Assemble 2D kernel
 static void PAConvectionSetup2D(const int NQ,
                                 const int NE,
@@ -151,7 +182,46 @@ static void PAConvectionSetup3D(const int NQ,
    });
 }
 
+static void PAConvectionSetup2DSurface(const int NQ,
+                                       const int NE,
+                                       const Array<real_t> &w,
+                                       const Vector &j,
+                                       const Vector &vel,
+                                       const real_t alpha,
+                                       Vector &op)
+{
+   constexpr int SDIM = 3;
+   const bool const_v = vel.Size() == SDIM;
+   const auto W = w.Read();
+   const auto J = Reshape(j.Read(), NQ,SDIM,2,NE);
+   const auto V = const_v ? Reshape(vel.Read(), SDIM,1,1)
+                          : Reshape(vel.Read(), SDIM,NQ,NE);
+   auto y = Reshape(op.Write(), NQ,2,NE);
+   mfem::forall(NE*NQ, [=] MFEM_HOST_DEVICE (int q_global)
+   {
+      const int e = q_global / NQ;
+      const int q = q_global % NQ;
+      real_t E = 0.0, F = 0.0, G = 0.0, b0 = 0.0, b1 = 0.0;
+      for (int d = 0; d < SDIM; d++)
+      {
+         const real_t j0 = J(q,d,0,e);
+         const real_t j1 = J(q,d,1,e);
+         const real_t v = const_v ? V(d,0,0) : V(d,q,e);
+         E += j0*j0;
+         F += j0*j1;
+         G += j1*j1;
+         b0 += j0*v;
+         b1 += j1*v;
+      }
+      const real_t measure = std::sqrt(E*G - F*F);
+      const real_t scale = alpha * W[q] / measure;
+      y(q,0,e) = scale * (G*b0 - F*b1);
+      y(q,1,e) = scale * (E*b1 - F*b0);
+   });
+}
+
 static void PAConvectionSetup(const int dim,
+                              const int sdim,
                               const int NQ,
                               const int NE,
                               const Array<real_t> &W,
@@ -160,10 +230,18 @@ static void PAConvectionSetup(const int dim,
                               const real_t alpha,
                               Vector &op)
 {
-   if (dim == 1) { MFEM_ABORT("dim==1 not supported in PAConvectionSetup"); }
+   if (dim == 1)
+   {
+      PAConvectionSetup1D(sdim, NQ, NE, W, J, coeff, alpha, op);
+   }
    if (dim == 2)
    {
-      PAConvectionSetup2D(NQ, NE, W, J, coeff, alpha, op);
+      if (sdim == 2) { PAConvectionSetup2D(NQ, NE, W, J, coeff, alpha, op); }
+      else if (sdim == 3)
+      {
+         PAConvectionSetup2DSurface(NQ, NE, W, J, coeff, alpha, op);
+      }
+      else { MFEM_ABORT("unsupported surface dimension"); }
    }
    if (dim == 3)
    {
@@ -209,7 +287,7 @@ void ConvectionIntegrator::AssemblePA(const FiniteElementSpace &fes)
    QuadratureSpace qs(*mesh, *ir);
    CoefficientVector vel(*Q, qs, CoefficientStorage::COMPRESSED);
 
-   PAConvectionSetup(dim, nq, ne, ir->GetWeights(), geom->J,
+   PAConvectionSetup(dim, mesh->SpaceDimension(), nq, ne, ir->GetWeights(), geom->J,
                      vel, alpha, pa_data);
 }
 
@@ -229,7 +307,11 @@ void ConvectionIntegrator::AssembleDiagonalPA(Vector &diag)
 inline ConvectionIntegrator::ApplyKernelType
 ConvectionIntegrator::ApplyPAKernels::Fallback(int DIM, int, int)
 {
-   if (DIM == 2)
+   if (DIM == 1)
+   {
+      return PAConvectionApply1D;
+   }
+   else if (DIM == 2)
    {
       return PAConvectionApply2D;
    }
@@ -246,7 +328,11 @@ ConvectionIntegrator::ApplyPAKernels::Fallback(int DIM, int, int)
 inline ConvectionIntegrator::ApplyKernelType
 ConvectionIntegrator::ApplyPATKernels::Fallback(int DIM, int, int)
 {
-   if (DIM == 2)
+   if (DIM == 1)
+   {
+      return PAConvectionApplyT1D;
+   }
+   else if (DIM == 2)
    {
       return PAConvectionApplyT2D;
    }

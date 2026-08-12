@@ -101,6 +101,68 @@ void solenoidal_field3d(const Vector &x, Vector &u)
    u(2) = x(0)*x(2);
 }
 
+TEST_CASE("PA mass and convection on embedded tensor surfaces",
+          "[PartialAssembly][MassIntegrator][ConvectionIntegrator]")
+{
+   const int parent_dim = GENERATE(2, 3);
+   Mesh parent = parent_dim == 2 ?
+                 Mesh::MakeCartesian2D(4, 2, Element::QUADRILATERAL,
+                                       false, 2.0, 1.0) :
+                 Mesh::MakeCartesian3D(3, 2, 1, Element::HEXAHEDRON,
+                                       2.0, 1.5, 1.0);
+   Array<int> attributes({parent_dim == 2 ? 3 : 6});
+   SubMesh surface = SubMesh::CreateFromBoundary(parent, attributes);
+   const int dim = surface.Dimension();
+   const int order = 3;
+   L2_FECollection fec(order, dim, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&surface, &fec);
+
+   VectorFunctionCoefficient velocity(parent_dim,
+      [parent_dim](const Vector &, Vector &value)
+   {
+      value.SetSize(parent_dim);
+      value = 0.0;
+      value[0] = 0.7;
+      if (parent_dim == 3) { value[1] = -0.4; }
+   });
+   FunctionCoefficient affine([parent_dim](const Vector &x)
+   {
+      return parent_dim == 2 ? x[0] : 0.17*x[0] - 0.23*x[1];
+   });
+   const real_t derivative = parent_dim == 2 ? 0.7 :
+                             0.7*0.17 + (-0.4)*(-0.23);
+   const Geometry::Type geometry = dim == 1 ? Geometry::SEGMENT : Geometry::SQUARE;
+   const IntegrationRule &ir = IntRules.Get(geometry, 4*order + 3);
+
+   BilinearForm mass_pa(&fes), mass_fa(&fes), convection_pa(&fes);
+   mass_pa.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   convection_pa.SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   mass_pa.AddDomainIntegrator(new MassIntegrator(&ir));
+   mass_fa.AddDomainIntegrator(new MassIntegrator(&ir));
+   auto *convection = new ConvectionIntegrator(velocity, 1.0);
+   convection->SetIntRule(&ir);
+   convection_pa.AddDomainIntegrator(convection);
+   mass_pa.Assemble();
+   mass_fa.Assemble(); mass_fa.Finalize();
+   convection_pa.Assemble();
+
+   GridFunction field(&fes);
+   field.ProjectCoefficient(affine);
+   Vector one(fes.GetVSize()), pa(fes.GetVSize()), reference(fes.GetVSize());
+   one = 1.0;
+
+   mass_pa.Mult(one, pa);
+   mass_fa.Mult(one, reference);
+   pa -= reference;
+   REQUIRE(pa.Normlinf() <= 5e-13*std::max(real_t(1.0), reference.Normlinf()));
+
+   convection_pa.Mult(field, pa);
+   mass_pa.Mult(one, reference);
+   reference *= derivative;
+   pa -= reference;
+   REQUIRE(pa.Normlinf() <= 5e-13*std::max(real_t(1.0), reference.Normlinf()));
+}
+
 void non_solenoidal_field3d(const Vector &x, Vector &u)
 {
    u(0) = x(0)*x(0);

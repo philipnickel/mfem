@@ -50,7 +50,9 @@ QuadratureInterpolator::DetKernelType
 QuadratureInterpolator::DetKernels::Fallback(
    int DIM, int SDIM, int D1D, int Q1D)
 {
-   if (DIM == 1) { return internal::quadrature_interpolator::Det1D; }
+   if (DIM == 1 && SDIM == 1) { return internal::quadrature_interpolator::Det1D; }
+   else if (DIM == 1 && SDIM == 2) { return internal::quadrature_interpolator::Det1DSurface<2>; }
+   else if (DIM == 1 && SDIM == 3) { return internal::quadrature_interpolator::Det1DSurface<3>; }
    else if (DIM == 2 && SDIM == 2) { return internal::quadrature_interpolator::Det2D; }
    else if (DIM == 2 && SDIM == 3) { return internal::quadrature_interpolator::Det2DSurface; }
    else if (DIM == 3)

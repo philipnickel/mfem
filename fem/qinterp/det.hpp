@@ -56,6 +56,41 @@ inline void Det1D(const int NE,
    });
 }
 
+template<int SDIM>
+inline void Det1DSurface(const int NE,
+                         const real_t *b,
+                         const real_t *g,
+                         const real_t *x,
+                         real_t *y,
+                         const int d1d,
+                         const int q1d,
+                         Vector *d_buff = nullptr)
+{
+   MFEM_CONTRACT_VAR(b);
+   MFEM_CONTRACT_VAR(d_buff);
+   const auto G = Reshape(g, q1d, d1d);
+   const auto X = Reshape(x, d1d, SDIM, NE);
+   auto Y = Reshape(y, q1d, NE);
+
+   mfem::forall(NE, [=] MFEM_HOST_DEVICE (int e)
+   {
+      for (int q = 0; q < q1d; q++)
+      {
+         real_t norm2 = 0.0;
+         for (int c = 0; c < SDIM; c++)
+         {
+            real_t derivative = 0.0;
+            for (int d = 0; d < d1d; d++)
+            {
+               derivative += G(q, d) * X(d, c, e);
+            }
+            norm2 += derivative * derivative;
+         }
+         Y(q, e) = std::sqrt(norm2);
+      }
+   });
+}
+
 template<int T_D1D = 0, int T_Q1D = 0>
 inline void Det2D(const int NE,
                   const real_t *b,
@@ -290,7 +325,9 @@ template<int DIM, int SDIM, int D1D, int Q1D>
 QuadratureInterpolator::DetKernelType
 QuadratureInterpolator::DetKernels::Kernel()
 {
-   if (DIM == 1) { return internal::quadrature_interpolator::Det1D; }
+   if (DIM == 1 && SDIM == 1) { return internal::quadrature_interpolator::Det1D; }
+   else if (DIM == 1 && SDIM == 2) { return internal::quadrature_interpolator::Det1DSurface<2>; }
+   else if (DIM == 1 && SDIM == 3) { return internal::quadrature_interpolator::Det1DSurface<3>; }
    else if (DIM == 2 && SDIM == 2) { return internal::quadrature_interpolator::Det2D<D1D, Q1D>; }
    else if (DIM == 2 && SDIM == 3) { return internal::quadrature_interpolator::Det2DSurface<D1D, Q1D>; }
    else if (DIM == 3) { return internal::quadrature_interpolator::Det3D<D1D, Q1D>; }

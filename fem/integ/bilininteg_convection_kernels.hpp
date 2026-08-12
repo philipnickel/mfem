@@ -22,6 +22,69 @@
 namespace mfem
 {
 
+// PA convection apply on a one-dimensional reference element. The setup
+// data already contains the metric-weighted tangential transport speed, so
+// this kernel is shared by straight 1D meshes and embedded curves.
+static void PAConvectionApply1D(const int ne,
+                                const Array<real_t> &b,
+                                const Array<real_t> &g,
+                                const Array<real_t> &bt,
+                                const Array<real_t> &gt,
+                                const Vector &op_,
+                                const Vector &x_,
+                                Vector &y_,
+                                const int d1d,
+                                const int q1d)
+{
+   MFEM_CONTRACT_VAR(bt);
+   MFEM_CONTRACT_VAR(gt);
+   const auto B = Reshape(b.Read(), q1d, d1d);
+   const auto G = Reshape(g.Read(), q1d, d1d);
+   const auto op = Reshape(op_.Read(), q1d, ne);
+   const auto x = Reshape(x_.Read(), d1d, ne);
+   auto y = Reshape(y_.ReadWrite(), d1d, ne);
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE (int e)
+   {
+      for (int q = 0; q < q1d; q++)
+      {
+         real_t derivative = 0.0;
+         for (int d = 0; d < d1d; d++) { derivative += G(q,d) * x(d,e); }
+         const real_t flux = op(q,e) * derivative;
+         for (int d = 0; d < d1d; d++) { y(d,e) += B(q,d) * flux; }
+      }
+   });
+}
+
+static void PAConvectionApplyT1D(const int ne,
+                                 const Array<real_t> &b,
+                                 const Array<real_t> &g,
+                                 const Array<real_t> &bt,
+                                 const Array<real_t> &gt,
+                                 const Vector &op_,
+                                 const Vector &x_,
+                                 Vector &y_,
+                                 const int d1d,
+                                 const int q1d)
+{
+   MFEM_CONTRACT_VAR(bt);
+   MFEM_CONTRACT_VAR(gt);
+   const auto B = Reshape(b.Read(), q1d, d1d);
+   const auto G = Reshape(g.Read(), q1d, d1d);
+   const auto op = Reshape(op_.Read(), q1d, ne);
+   const auto x = Reshape(x_.Read(), d1d, ne);
+   auto y = Reshape(y_.ReadWrite(), d1d, ne);
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE (int e)
+   {
+      for (int q = 0; q < q1d; q++)
+      {
+         real_t value = 0.0;
+         for (int d = 0; d < d1d; d++) { value += B(q,d) * x(d,e); }
+         const real_t flux = op(q,e) * value;
+         for (int d = 0; d < d1d; d++) { y(d,e) += G(q,d) * flux; }
+      }
+   });
+}
+
 // PA Convection Apply 2D kernel
 template<int T_D1D = 0, int T_Q1D = 0> static
 void PAConvectionApply2D(const int ne,

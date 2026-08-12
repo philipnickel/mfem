@@ -252,6 +252,9 @@ public:
    void SetUpwindFactor(real_t value);
    real_t GetUpwindFactor() const { return upwind_factor; }
    void Mult(const Vector &x, Vector &y) const override;
+   /// Assemble only the two-trace LLF junction correction (before M^{-1}).
+   void FaceMult(const Vector &elevation, const Vector &velocity_x,
+                 Vector &face_load) const;
    /// Apply from three native scalar blocks without constructing device-unsafe aliases.
    void Mult3(const Vector &elevation, const Vector &velocity_x,
               const Vector &velocity_y, Vector &rate) const;
@@ -300,6 +303,9 @@ public:
    void SetUpwindFactor(real_t value);
    real_t GetUpwindFactor() const { return upwind_factor; }
    void Mult(const Vector &x, Vector &y) const override;
+   /// Assemble only the two-trace LLF edge correction (before M^{-1}).
+   void FaceMult(const Vector &elevation, const Vector &velocity_x,
+                 const Vector &velocity_y, Vector &face_load) const;
    void Mult4(const Vector &elevation, const Vector &velocity_x,
               const Vector &velocity_y, const Vector &velocity_z,
               Vector &rate) const;

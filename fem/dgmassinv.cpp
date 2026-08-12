@@ -159,6 +159,58 @@ void SurfaceKinematicOperator::SetUpwindFactor(real_t value)
    upwind_factor = value;
 }
 
+void SurfaceKinematicOperator::FaceMult(const Vector &elevation,
+                                        const Vector &velocity_x,
+                                        Vector &face_load) const
+{
+   MFEM_VERIFY(elevation.Size() == scalar_size &&
+               velocity_x.Size() == scalar_size,
+               "surface kinematic face input has wrong size");
+   face_load.SetSize(scalar_size);
+   face_load.UseDevice(true);
+   face_load = 0.0;
+   if (face_restriction->Height() == 0) { return; }
+
+   Vector component;
+   component.MakeRef(element_values, 0, scalar_size);
+   real_t *scalar = element_values.ReadWrite();
+   const real_t *E = elevation.Read();
+   mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+   {
+      scalar[i] = E[i];
+   });
+   face_restriction->Mult(component, eta_face);
+   const real_t *U = velocity_x.Read();
+   mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+   {
+      scalar[i] = U[i];
+   });
+   face_restriction->Mult(component, velocity_face);
+
+   const int nfaces = face_restriction->Height() / 2;
+   const real_t *O = orientation_face.Read();
+   const real_t *EF = eta_face.Read();
+   const real_t *UF = velocity_face.Read();
+   real_t *F = face_flux.Write();
+   const real_t alpha = upwind_factor;
+   mfem::forall(nfaces, [=] MFEM_HOST_DEVICE(int f)
+   {
+      const bool first_is_left = O[2*f] > 0.0;
+      const int left = 2*f + (first_is_left ? 0 : 1);
+      const int right = 2*f + (first_is_left ? 1 : 0);
+      const real_t eta_left = EF[left];
+      const real_t eta_right = EF[right];
+      const real_t u_left = UF[left];
+      const real_t u_right = UF[right];
+      const real_t speed = 0.5 * (u_left + u_right);
+      const real_t radius = alpha * fmax(fabs(u_left), fabs(u_right));
+      const real_t jump = eta_left - eta_right;
+      F[left] = 0.5 * (speed - radius) * jump;
+      F[right] = 0.5 * (speed + radius) * jump;
+   });
+   face_restriction->MultTranspose(face_flux, face_load);
+}
+
 void SurfaceKinematicOperator::Mult(const Vector &x, Vector &y) const
 {
    const bool debug_device = Device::Allows(Backend::DEBUG_DEVICE);
@@ -525,6 +577,104 @@ void SurfaceKinematicOperator2D::SetUpwindFactor(real_t value)
    MFEM_VERIFY(value >= 0.0 && std::isfinite(value),
                "surface upwind factor must be finite and non-negative");
    upwind_factor = value;
+}
+
+void SurfaceKinematicOperator2D::FaceMult(const Vector &elevation,
+                                          const Vector &velocity_x,
+                                          const Vector &velocity_y,
+                                          Vector &face_load) const
+{
+   MFEM_VERIFY(elevation.Size() == scalar_size &&
+               velocity_x.Size() == scalar_size &&
+               velocity_y.Size() == scalar_size,
+               "2D surface kinematic face input has wrong size");
+   face_load.SetSize(scalar_size);
+   face_load.UseDevice(true);
+   face_load = 0.0;
+   if (nf == 0) { return; }
+
+   const Vector *components[3] = {&elevation, &velocity_x, &velocity_y};
+   const int face_size = 2 * nf * face_nd;
+   for (int c = 0; c < 3; ++c)
+   {
+      Vector component, restricted;
+      component.MakeRef(element_values, 0, scalar_size);
+      const real_t *source = components[c]->Read();
+      real_t *scalar = element_values.Write();
+      mfem::forall(scalar_size, [=] MFEM_HOST_DEVICE(int i)
+      {
+         scalar[i] = source[i];
+      });
+      restricted.MakeRef(face_element_values, c * face_size, face_size);
+      face_restriction->Mult(component, restricted);
+   }
+
+   const real_t *FB = face_maps->B.Read();
+   const real_t *FE = face_element_values.Read();
+   real_t *FV = face_values.Write();
+   const int values_per_component = 2 * nf * face_nq;
+   mfem::forall(3 * values_per_component, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int q = i % face_nq;
+      const int side = (i / face_nq) % 2;
+      const int face = (i / (2 * face_nq)) % nf;
+      const int component_index = i / values_per_component;
+      real_t value = 0.0;
+      for (int d = 0; d < face_nd; ++d)
+      {
+         const int source =
+            d + face_nd * (side + 2 * (face + nf * component_index));
+         value += FB[q + face_nq * d] * FE[source];
+      }
+      FV[i] = value;
+   });
+
+   const real_t *N = face_normals.Read();
+   const real_t *FW = face_weights.Read();
+   const real_t *S = face_values.Read();
+   real_t *FQ = face_quadrature_flux.Write();
+   const real_t alpha = upwind_factor;
+   mfem::forall(nf * face_nq, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int q = i % face_nq;
+      const int face = i / face_nq;
+      const int side0 = q + face_nq * (0 + 2 * face);
+      const int side1 = q + face_nq * (1 + 2 * face);
+      const real_t normal_x = N[2 * i + 0];
+      const real_t normal_y = N[2 * i + 1];
+      const real_t eta0 = S[side0];
+      const real_t eta1 = S[side1];
+      const real_t ux0 = S[side0 + values_per_component];
+      const real_t ux1 = S[side1 + values_per_component];
+      const real_t uy0 = S[side0 + 2 * values_per_component];
+      const real_t uy1 = S[side1 + 2 * values_per_component];
+      const real_t speed0 = ux0 * normal_x + uy0 * normal_y;
+      const real_t speed1 = ux1 * normal_x + uy1 * normal_y;
+      const real_t speed = 0.5 * (speed0 + speed1);
+      const real_t radius = alpha * fmax(fabs(speed0), fabs(speed1));
+      const real_t jump = eta0 - eta1;
+      const real_t scale = FW[i];
+      FQ[side0] = scale * 0.5 * (speed - radius) * jump;
+      FQ[side1] = scale * 0.5 * (speed + radius) * jump;
+   });
+
+   const real_t *FBt = face_maps->Bt.Read();
+   const real_t *FQL = face_quadrature_flux.Read();
+   real_t *FEL = face_element_flux.Write();
+   mfem::forall(2 * nf * face_nd, [=] MFEM_HOST_DEVICE(int i)
+   {
+      const int d = i % face_nd;
+      const int side = (i / face_nd) % 2;
+      const int face = i / (2 * face_nd);
+      real_t value = 0.0;
+      for (int q = 0; q < face_nq; ++q)
+      {
+         value += FBt[d + face_nd * q] *
+                  FQL[q + face_nq * (side + 2 * face)];
+      }
+      FEL[i] = value;
+   });
+   face_restriction->MultTranspose(face_element_flux, face_load);
 }
 
 void SurfaceKinematicOperator2D::Mult(const Vector &x, Vector &y) const
