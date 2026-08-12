@@ -265,7 +265,7 @@ TEST_CASE("DG diffusion face diagonal PA",
    coefficient_form.AddInteriorFaceIntegrator(
       new DGDiffusionIntegrator(one, sigma, kappa));
    coefficient_form.Assemble();
-   REQUIRE_FALSE(coefficient_form.SupportsNativeFaceDiagonalAssembly());
+   REQUIRE(coefficient_form.SupportsNativeFaceDiagonalAssembly());
 
    H1_FECollection continuous_collection(order, dimension);
    FiniteElementSpace continuous_space(&mesh, &continuous_collection);

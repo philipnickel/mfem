@@ -525,7 +525,7 @@ void DGDiffusionIntegrator::SetupPA(const FiniteElementSpace &fes,
    const MemoryType mt =
       (pa_mt == MemoryType::DEFAULT) ? Device::GetDeviceMemoryType() : pa_mt;
 
-   const int ne = fes.GetNE();
+   ne = fes.GetNE();
    nf = fes.GetNFbyType(type);
 
    // Assumes tensor-product elements
@@ -555,6 +555,9 @@ void DGDiffusionIntegrator::SetupPA(const FiniteElementSpace &fes,
       FaceGeometricFactors::DETERMINANTS | FaceGeometricFactors::NORMALS;
    auto face_geom = mesh.GetFaceGeometricFactors(ir, face_geom_flags, type, mt);
    maps = &el.GetDofToQuad(ir, DofToQuad::TENSOR);
+   const FiniteElement &volume_element = *fes.GetTypicalFE();
+   normal_maps = &volume_element.GetDofToQuad(
+                    volume_element.GetNodes(), DofToQuad::TENSOR);
    dofs1D = maps->ndof;
    quad1D = maps->nqpt;
 
@@ -577,24 +580,23 @@ void DGDiffusionIntegrator::SetupPA(const FiniteElementSpace &fes,
 
    const int coeff_dim = q.GetVDim();
 
-   Array<int> face_info;
    if (dim == 1)
    {
       MFEM_ABORT("dim==1 not supported in PADGTraceSetup");
    }
    else if (dim == 2)
    {
-      PADGDiffusionSetupFaceInfo2D(nf, mesh, type, face_info);
+      PADGDiffusionSetupFaceInfo2D(nf, mesh, type, pa_face_info);
       PADGDiffusionSetup2D(quad1D, ne, nf, ir.GetWeights(), *el_geom,
                            *face_geom, nbr_geom.get(), q, coeff_dim, kq, use_kq,
-                           sigma, kappa, pa_data, face_info);
+                           sigma, kappa, pa_data, pa_face_info);
    }
    else if (dim == 3)
    {
-      PADGDiffusionSetupFaceInfo3D(nf, mesh, type, face_info);
+      PADGDiffusionSetupFaceInfo3D(nf, mesh, type, pa_face_info);
       PADGDiffusionSetup3D(quad1D, ne, nf, ir.GetWeights(), *el_geom,
                            *face_geom, nbr_geom.get(), q, coeff_dim, kq, use_kq,
-                           sigma, kappa, pa_data, face_info);
+                           sigma, kappa, pa_data, pa_face_info);
    }
 }
 
@@ -608,6 +610,147 @@ void DGDiffusionIntegrator::AssemblePABoundaryFaces(
    const FiniteElementSpace &fes)
 {
    SetupPA(fes, FaceType::Boundary);
+}
+
+void DGDiffusionIntegrator::AddAssemblePAFaceDiagonal(
+   const Array<int> *face_attributes, const Array<int> *marker,
+   Vector &diagonal) const
+{
+   if (nf == 0) { return; }
+   MFEM_VERIFY((face_attributes == nullptr) == (marker == nullptr),
+               "face attributes and marker must be supplied together");
+   if (face_attributes)
+   {
+      MFEM_VERIFY(face_attributes->Size() == nf,
+                  "boundary attributes do not match the PA face layout");
+   }
+   MFEM_VERIFY(normal_maps && normal_maps->ndof == dofs1D &&
+               normal_maps->nqpt == dofs1D,
+               "unsupported normal-derivative tensor map");
+
+   const int *attributes = face_attributes ? face_attributes->Read() : nullptr;
+   const int *enabled = marker ? marker->Read() : nullptr;
+   const int marker_size = marker ? marker->Size() : 0;
+   const int D1D = dofs1D;
+   const int Q1D = quad1D;
+   const real_t derivative_scale = sigma - 1.0;
+   const auto B = Reshape(maps->B.Read(), Q1D, D1D);
+   const auto G = Reshape(maps->G.Read(), Q1D, D1D);
+   const auto GN = Reshape(normal_maps->G.Read(), D1D, D1D);
+   auto d = diagonal.ReadWrite();
+
+   if (dim == 2)
+   {
+      const auto info = Reshape(pa_face_info.Read(), 6, nf);
+      const auto pa = Reshape(pa_data.Read(), 6, Q1D, nf);
+      mfem::forall_2D(nf, D1D, 2,
+                      [=] MFEM_HOST_DEVICE (int face) -> void
+      {
+         if (attributes)
+         {
+            const int attribute = attributes[face];
+            if (attribute <= 0 || attribute > marker_size ||
+                enabled[attribute - 1] == 0) { return; }
+         }
+         MFEM_FOREACH_THREAD(face_dof, x, D1D)
+         {
+            MFEM_FOREACH_THREAD(side, y, 2)
+            {
+               const int element = info(2 + side, face);
+               if (element < 0 || element >= ne) { continue; }
+               const int fid0 = info(4, face);
+               const int fid1 = info(5, face);
+               int i, j;
+               internal::FaceIdxToVolIdx2D(
+                  face_dof, D1D, fid0, fid1, side, i, j);
+               const int normal_direction = info(side, face);
+               const int normal_dof = normal_direction == 0 ? i : j;
+               const real_t normal_derivative = GN(normal_dof, normal_dof);
+               const real_t jump_sign = side == 0 ? 1.0 : -1.0;
+               real_t value = 0.0;
+               for (int point = 0; point < Q1D; ++point)
+               {
+                  const real_t b = B(point, face_dof);
+                  const real_t g = G(point, face_dof);
+                  const real_t normal = pa(2 + 2 * side, point, face);
+                  const real_t tangent = pa(3 + 2 * side, point, face);
+                  value += derivative_scale * jump_sign *
+                           (normal_derivative * normal * b * b +
+                            tangent * b * g) +
+                           pa(0, point, face) * pa(1, point, face) * b * b;
+               }
+               AtomicAdd(d[i + D1D * (j + D1D * element)], value);
+            }
+         }
+      });
+      return;
+   }
+
+   if (dim == 3)
+   {
+      const auto info = Reshape(pa_face_info.Read(), 6, 2, nf);
+      const auto pa = Reshape(pa_data.Read(), 7, Q1D, Q1D, nf);
+      mfem::forall_3D(nf, D1D, D1D, 2,
+                      [=] MFEM_HOST_DEVICE (int face) -> void
+      {
+         if (attributes)
+         {
+            const int attribute = attributes[face];
+            if (attribute <= 0 || attribute > marker_size ||
+                enabled[attribute - 1] == 0) { return; }
+         }
+         MFEM_FOREACH_THREAD(d1, x, D1D)
+         {
+            MFEM_FOREACH_THREAD(d2, y, D1D)
+            {
+               MFEM_FOREACH_THREAD(side, z, 2)
+               {
+                  const int element = info(3, side, face);
+                  if (element < 0 || element >= ne) { continue; }
+                  const int fid0 = info(4, 0, face);
+                  const int fid1 = info(4, 1, face);
+                  const int orientation = info(5, 1, face);
+                  int i, j, k;
+                  internal::FaceIdxToVolIdx3D(
+                     d1 + D1D * d2, D1D, fid0, fid1, side,
+                     orientation, i, j, k);
+                  const int signed_normal_direction = info(0, side, face);
+                  const int normal_direction =
+                     (signed_normal_direction < 0 ? -signed_normal_direction :
+                      signed_normal_direction) - 1;
+                  const int normal_dof = normal_direction == 0 ? i :
+                                         normal_direction == 1 ? j : k;
+                  const real_t normal_derivative = GN(normal_dof, normal_dof);
+                  const real_t jump_sign = side == 0 ? 1.0 : -1.0;
+                  real_t value = 0.0;
+                  for (int p2 = 0; p2 < Q1D; ++p2)
+                  {
+                     const real_t b2 = B(p2, d2);
+                     const real_t g2 = G(p2, d2);
+                     for (int p1 = 0; p1 < Q1D; ++p1)
+                     {
+                        const real_t b1 = B(p1, d1);
+                        const real_t g1 = G(p1, d1);
+                        const real_t trace = b1 * b2;
+                        value += derivative_scale * jump_sign *
+                                 (normal_derivative * pa(3 * side, p1, p2, face) *
+                                  trace * trace +
+                                  pa(3 * side + 1, p1, p2, face) *
+                                  trace * g1 * b2 +
+                                  pa(3 * side + 2, p1, p2, face) *
+                                  trace * b1 * g2) +
+                                 pa(6, p1, p2, face) * trace * trace;
+                     }
+                  }
+                  AtomicAdd(
+                     d[i + D1D * (j + D1D * (k + D1D * element))], value);
+               }
+            }
+         }
+      });
+      return;
+   }
+   MFEM_ABORT("unsupported dimension in PA DG diffusion face diagonal");
 }
 
 void DGDiffusionIntegrator::AddMultPAFaceNormalDerivatives(const Vector &x,

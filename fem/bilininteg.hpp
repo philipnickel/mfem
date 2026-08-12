@@ -3589,7 +3589,9 @@ protected:
    // PA extension
    Vector pa_data; // (Q, h, dot(n,J)|el0, dot(n,J)|el1)
    const DofToQuad *maps; ///< Not owned
-   int dim, nf, nq, dofs1D, quad1D;
+   const DofToQuad *normal_maps; ///< Not owned
+   Array<int> pa_face_info;
+   int dim, ne, nf, nq, dofs1D, quad1D;
    IntegrationRules irs{0, Quadrature1D::GaussLobatto};
 
 public:
@@ -3605,12 +3607,14 @@ public:
        semantics as this direct kernel. */
    bool SupportsPAFaceDiagonalAssembly() const
    {
-      // The PA kernel projects one face value of Q, whereas the legacy
-      // element kernel evaluates Q independently from both adjacent elements.
-      // Until the diagonal is formed directly from pa_data, advertise only
-      // the coefficient-free diffusion case for which the two are identical.
-      return Q == nullptr && MQ == nullptr;
+      return true;
    }
+
+   /** @brief Add the diagonal of the assembled PA face action directly to an
+       L2 L-vector. Optional face attributes and marker select boundary faces. */
+   void AddAssemblePAFaceDiagonal(const Array<int> *face_attributes,
+                                  const Array<int> *marker,
+                                  Vector &diag) const;
 
    /** @brief Assemble the diagonal of this integrator's partial-assembly face
        action.

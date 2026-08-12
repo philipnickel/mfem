@@ -256,24 +256,6 @@ PABilinearFormExtension::PABilinearFormExtension(BilinearForm *form)
 namespace
 {
 
-int DecodeDiagonalDof(const int dof)
-{
-   // A signed finite-element restriction contributes s*A_ii*s to the
-   // diagonal. Since s is +/-1, orientation signs cancel.
-   return dof >= 0 ? dof : -1 - dof;
-}
-
-void AddFaceDiagonal(const Vector &face_diagonal,
-                     const int face_offset,
-                     const Array<int> &vdofs,
-                     real_t *diagonal)
-{
-   for (int i = 0; i < vdofs.Size(); ++i)
-   {
-      diagonal[DecodeDiagonalDof(vdofs[i])] += face_diagonal(face_offset + i);
-   }
-}
-
 /** Add native face-integrator diagonals to a partially assembled form. */
 void AddNativeFaceDiagonal(BilinearForm &form,
                            const FiniteElementSpace &fes,
@@ -283,113 +265,24 @@ void AddNativeFaceDiagonal(BilinearForm &form,
    Array<BilinearFormIntegrator*> &boundary = *form.GetBFBFI();
    if (interior.Size() == 0 && boundary.Size() == 0) { return; }
 
-   Array<int> vdofs1, vdofs2;
-   Vector face_diagonal;
-   Mesh &mesh = *fes.GetMesh();
-   real_t *diag = diagonal.HostReadWrite();
-
-   if (interior.Size() > 0)
+   diagonal.UseDevice(true);
+   for (BilinearFormIntegrator *integrator : interior)
    {
-      for (int face = 0; face < mesh.GetNumFaces(); ++face)
-      {
-         FaceElementTransformations *transformation =
-            mesh.GetInteriorFaceTransformations(face);
-         if (!transformation) { continue; }
-
-         const int element1 = transformation->Elem1No;
-         const int element2 = transformation->Elem2No;
-         const FiniteElement &finite_element1 = *fes.GetFE(element1);
-         const FiniteElement &finite_element2 = *fes.GetFE(element2);
-         fes.GetElementVDofs(element1, vdofs1);
-         fes.GetElementVDofs(element2, vdofs2);
-
-         for (BilinearFormIntegrator *integrator : interior)
-         {
-            auto *diffusion = dynamic_cast<DGDiffusionIntegrator*>(integrator);
-            MFEM_ASSERT(diffusion, "unsupported PA face diagonal integrator");
-            diffusion->AssemblePAFaceDiagonal(finite_element1, finite_element2,
-                                              *transformation, face_diagonal);
-            MFEM_ASSERT(face_diagonal.Size() == vdofs1.Size() + vdofs2.Size(),
-                        "invalid interior face diagonal size");
-            AddFaceDiagonal(face_diagonal, 0, vdofs1, diag);
-            AddFaceDiagonal(face_diagonal, vdofs1.Size(), vdofs2, diag);
-         }
-      }
-
-#ifdef MFEM_USE_MPI
-      // Shared faces are not returned by GetInteriorFaceTransformations. Each
-      // rank owns and accumulates only its local element block; the peer rank
-      // does the symmetric operation for its own block.
-      if (auto *parallel_fes =
-             dynamic_cast<const ParFiniteElementSpace*>(&fes))
-      {
-         // ExchangeFaceNbrData lazily initializes cached neighbor metadata.
-         // ExchangeFaceNbrNodes also refreshes curved neighbor geometry after
-         // a moving-mesh update; calling it here makes this path correct even
-         // when the caller did not pre-refresh ParMesh's node cache.
-         const_cast<ParFiniteElementSpace*>(parallel_fes)->ExchangeFaceNbrData();
-         ParMesh &parallel_mesh = *parallel_fes->GetParMesh();
-         const int shared_faces = parallel_mesh.GetNSharedFaces();
-         if (shared_faces > 0) { parallel_mesh.ExchangeFaceNbrNodes(); }
-         for (int face = 0; face < shared_faces; ++face)
-         {
-            FaceElementTransformations *transformation =
-               parallel_mesh.GetSharedFaceTransformations(face);
-            if (!transformation) { continue; }
-
-            const int element1 = transformation->Elem1No;
-            const int neighbor = transformation->Elem2No - parallel_mesh.GetNE();
-            const FiniteElement &finite_element1 = *parallel_fes->GetFE(element1);
-            const FiniteElement &finite_element2 =
-               *parallel_fes->GetFaceNbrFE(neighbor);
-            parallel_fes->GetElementVDofs(element1, vdofs1);
-
-            for (BilinearFormIntegrator *integrator : interior)
-            {
-               auto *diffusion = dynamic_cast<DGDiffusionIntegrator*>(integrator);
-               MFEM_ASSERT(diffusion, "unsupported PA face diagonal integrator");
-               diffusion->AssemblePAFaceDiagonal(finite_element1, finite_element2,
-                                                 *transformation, face_diagonal);
-               MFEM_ASSERT(face_diagonal.Size() >= vdofs1.Size(),
-                           "invalid shared-face diagonal size");
-               AddFaceDiagonal(face_diagonal, 0, vdofs1, diag);
-            }
-         }
-      }
-#endif
+      auto *diffusion = dynamic_cast<DGDiffusionIntegrator*>(integrator);
+      MFEM_ASSERT(diffusion, "unsupported PA face diagonal integrator");
+      diffusion->AddAssemblePAFaceDiagonal(nullptr, nullptr, diagonal);
    }
 
    if (boundary.Size() == 0) { return; }
    Array<Array<int>*> &boundary_markers = *form.GetBFBFI_Marker();
-
-   for (int boundary_element = 0; boundary_element < mesh.GetNBE();
-        ++boundary_element)
+   const Array<int> &boundary_attributes = fes.GetMesh()->GetBdrFaceAttributes();
+   for (int i = 0; i < boundary.Size(); ++i)
    {
-      FaceElementTransformations *transformation =
-         mesh.GetBdrFaceTransformations(boundary_element);
-      if (!transformation) { continue; }
-
-      const int attribute = mesh.GetBdrAttribute(boundary_element);
-      const int element1 = transformation->Elem1No;
-      const FiniteElement &finite_element1 = *fes.GetFE(element1);
-      fes.GetElementVDofs(element1, vdofs1);
-
-      for (int i = 0; i < boundary.Size(); ++i)
-      {
-         const Array<int> *marker = boundary_markers[i];
-         if (marker && (attribute <= 0 || attribute > marker->Size() ||
-                        (*marker)[attribute - 1] == 0))
-         {
-            continue;
-         }
-         auto *diffusion = dynamic_cast<DGDiffusionIntegrator*>(boundary[i]);
-         MFEM_ASSERT(diffusion, "unsupported PA face diagonal integrator");
-         diffusion->AssemblePAFaceDiagonal(finite_element1, finite_element1,
-                                           *transformation, face_diagonal);
-         MFEM_ASSERT(face_diagonal.Size() == vdofs1.Size(),
-                     "invalid boundary face diagonal size");
-         AddFaceDiagonal(face_diagonal, 0, vdofs1, diag);
-      }
+      auto *diffusion = dynamic_cast<DGDiffusionIntegrator*>(boundary[i]);
+      MFEM_ASSERT(diffusion, "unsupported PA face diagonal integrator");
+      const Array<int> *marker = boundary_markers[i];
+      diffusion->AddAssemblePAFaceDiagonal(
+         marker ? &boundary_attributes : nullptr, marker, diagonal);
    }
 }
 
