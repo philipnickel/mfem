@@ -95,6 +95,104 @@ void PAVectorDivDivSetup3D(const int q1d, const int ne,
    });
 }
 
+void PAVectorDivDivAssembleDiagonal2D(const int ne,
+                                      const Array<real_t> &b,
+                                      const Array<real_t> &g,
+                                      const Vector &op_, Vector &diag_,
+                                      const int d1d, const int q1d)
+{
+   if (ne == 0) { return; }
+   MFEM_VERIFY(d1d <= DeviceDofQuadLimits::Get().MAX_D1D, "");
+   MFEM_VERIFY(q1d <= DeviceDofQuadLimits::Get().MAX_Q1D, "");
+
+   const auto B = Reshape(b.Read(), q1d, d1d);
+   const auto G = Reshape(g.Read(), q1d, d1d);
+   const auto R = Reshape(op_.Read(), q1d*q1d, 2, 2, ne);
+   auto D = Reshape(diag_.ReadWrite(), d1d, d1d, 2, ne);
+
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE (int e)
+   {
+      for (int c = 0; c < 2; ++c)
+      {
+         for (int dy = 0; dy < d1d; ++dy)
+         {
+            for (int dx = 0; dx < d1d; ++dx)
+            {
+               real_t value = 0.0;
+               for (int qy = 0; qy < q1d; ++qy)
+               {
+                  const real_t by = B(qy,dy);
+                  const real_t gy = G(qy,dy);
+                  for (int qx = 0; qx < q1d; ++qx)
+                  {
+                     const int q = qx + q1d*qy;
+                     const real_t divergence =
+                        G(qx,dx)*by*R(q,0,c,e) +
+                        B(qx,dx)*gy*R(q,1,c,e);
+                     value += divergence*divergence;
+                  }
+               }
+               D(dx,dy,c,e) += value;
+            }
+         }
+      }
+   });
+}
+
+void PAVectorDivDivAssembleDiagonal3D(const int ne,
+                                      const Array<real_t> &b,
+                                      const Array<real_t> &g,
+                                      const Vector &op_, Vector &diag_,
+                                      const int d1d, const int q1d)
+{
+   if (ne == 0) { return; }
+   MFEM_VERIFY(d1d <= DeviceDofQuadLimits::Get().MAX_D1D, "");
+   MFEM_VERIFY(q1d <= DeviceDofQuadLimits::Get().MAX_Q1D, "");
+
+   const auto B = Reshape(b.Read(), q1d, d1d);
+   const auto G = Reshape(g.Read(), q1d, d1d);
+   const auto R = Reshape(op_.Read(), q1d*q1d*q1d, 3, 3, ne);
+   auto D = Reshape(diag_.ReadWrite(), d1d, d1d, d1d, 3, ne);
+
+   mfem::forall(ne, [=] MFEM_HOST_DEVICE (int e)
+   {
+      for (int c = 0; c < 3; ++c)
+      {
+         for (int dz = 0; dz < d1d; ++dz)
+         {
+            for (int dy = 0; dy < d1d; ++dy)
+            {
+               for (int dx = 0; dx < d1d; ++dx)
+               {
+                  real_t value = 0.0;
+                  for (int qz = 0; qz < q1d; ++qz)
+                  {
+                     const real_t bz = B(qz,dz);
+                     const real_t gz = G(qz,dz);
+                     for (int qy = 0; qy < q1d; ++qy)
+                     {
+                        const real_t by = B(qy,dy);
+                        const real_t gy = G(qy,dy);
+                        for (int qx = 0; qx < q1d; ++qx)
+                        {
+                           const int q = qx + q1d*(qy + q1d*qz);
+                           const real_t bx = B(qx,dx);
+                           const real_t divergence =
+                              G(qx,dx)*by*bz*R(q,0,c,e) +
+                              bx*gy*bz*R(q,1,c,e) +
+                              bx*by*gz*R(q,2,c,e);
+                           value += divergence*divergence;
+                        }
+                     }
+                  }
+                  D(dx,dy,dz,c,e) += value;
+               }
+            }
+         }
+      }
+   });
+}
+
 template <int T_D1D = 0, int T_Q1D = 0>
 void PAVectorDivDivApply2D(const int ne,
                            const Array<real_t> &b,
@@ -525,6 +623,20 @@ void VectorDivDivIntegrator::AddMultPA(const Vector &x, Vector &y) const
       PAVectorDivDivApply3D(ne, maps->B, maps->G, maps->Bt, maps->Gt,
                             pa_data, x, y, quadrature_divergence,
                             dofs1D, quad1D);
+   }
+}
+
+void VectorDivDivIntegrator::AssembleDiagonalPA(Vector &diag)
+{
+   if (dim == 2)
+   {
+      PAVectorDivDivAssembleDiagonal2D(ne, maps->B, maps->G, pa_data,
+                                       diag, dofs1D, quad1D);
+   }
+   else
+   {
+      PAVectorDivDivAssembleDiagonal3D(ne, maps->B, maps->G, pa_data,
+                                       diag, dofs1D, quad1D);
    }
 }
 

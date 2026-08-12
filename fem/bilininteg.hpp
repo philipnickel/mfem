@@ -3105,6 +3105,7 @@ public:
 
    using BilinearFormIntegrator::AssemblePA;
    void AssemblePA(const FiniteElementSpace &fes) override;
+   void AssembleDiagonalPA(Vector &diag) override;
    void AddMultPA(const Vector &x, Vector &y) const override;
    void AddMultTransposePA(const Vector &x, Vector &y) const override;
 };

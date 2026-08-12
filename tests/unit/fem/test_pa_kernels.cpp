@@ -292,6 +292,14 @@ TEST_CASE("PA VectorDivDiv on curved L2 elements",
    const real_t reference_norm = y_assembled.Norml2();
    REQUIRE(error.Norml2() <= 2e-12*std::max(reference_norm, real_t(1.0)));
 
+   Vector pa_diagonal(fes.GetVSize());
+   pa.AssembleDiagonal(pa_diagonal);
+   Vector assembled_diagonal(fes.GetVSize());
+   assembled.SpMat().GetDiag(assembled_diagonal);
+   pa_diagonal -= assembled_diagonal;
+   REQUIRE(pa_diagonal.Normlinf() <=
+           2e-12*std::max(assembled_diagonal.Normlinf(), real_t(1.0)));
+
    // SetElementCoefficient owns a fresh copy. Reassembly must replace, rather
    // than accumulate onto, the old quadrature data.
    constexpr real_t coefficient_scale = 1.75;
