@@ -222,6 +222,38 @@ public:
    const Vector &GetElementVolumes() const { return volumes; }
 };
 
+/** @brief Element-local Fehn ALE convective CFL rate.
+
+    The input is a broken vector field in byNODES ordering containing the ALE
+    relative velocity @f$u-u_G@f$. At every supplied quadrature point this
+    operator evaluates
+
+    @f[ \left\|J^{-T}(u-u_G)\right\|_2, @f]
+
+    and Mult() returns its maximum for every local element. ComputeMax()
+    performs the same native action and returns the maximum over local
+    elements. The caller owns the MPI maximum and the
+    @f$\mathrm{Cr}/k^{1.5}@f$ scaling from Fehn et al.'s adaptive CFL
+    condition. */
+class FehnALECFLRateOperator : public Operator
+{
+private:
+   FiniteElementSpace &fes;
+   const IntegrationRule &ir;
+   const ElementRestrictionOperator *element_restriction = nullptr; ///< Not owned.
+   const QuadratureInterpolator *quadrature_interpolator = nullptr; ///< Not owned.
+   int dim, ne, nd, nq;
+   mutable Vector element_values, quadrature_values, element_rates;
+
+public:
+   FehnALECFLRateOperator(FiniteElementSpace &fes_,
+                          const IntegrationRule &ir_);
+   void Mult(const Vector &relative_velocity,
+             Vector &element_rate) const override;
+   real_t ComputeMax(const Vector &relative_velocity) const;
+   const Vector &GetElementRates() const { return element_rates; }
+};
+
 /** @brief Native one-dimensional free-surface kinematic operator.
 
     The packed input contains elevation, horizontal velocity, and vertical

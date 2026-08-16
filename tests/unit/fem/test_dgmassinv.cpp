@@ -207,6 +207,43 @@ TEST_CASE("Vector DG Mass Inverse is componentwise",
            5e-12*std::max(b0.Norml2(), real_t(1.0)));
 }
 
+TEST_CASE("Fehn ALE CFL rate is quadrature-point local",
+          "[GPU][FehnALECFLRate]")
+{
+   const int dim = GENERATE(2, 3);
+   constexpr int order = 3;
+   Mesh mesh = dim == 2 ?
+               Mesh::MakeCartesian2D(
+                  2, 1, Element::QUADRILATERAL, true, 2.0, 0.25) :
+               Mesh::MakeCartesian3D(
+                  2, 1, 1, Element::HEXAHEDRON, 2.0, 0.25, 0.125);
+   mesh.SetCurvature(order, false, dim, Ordering::byNODES);
+   L2_FECollection fec(order, dim, BasisType::GaussLobatto);
+   FiniteElementSpace fes(&mesh, &fec, dim, Ordering::byNODES);
+   const Geometry::Type geometry = dim == 2 ? Geometry::SQUARE : Geometry::CUBE;
+   const IntegrationRule &ir = IntRules.Get(geometry, 2*order + 1);
+   FehnALECFLRateOperator rate(fes, ir);
+
+   Vector velocity(fes.GetVSize());
+   const int scalar_size = fes.GetNDofs();
+   for (int c = 0; c < dim; ++c)
+   {
+      const real_t value = c == 0 ? 2.0 : (c == 1 ? 0.5 : 0.25);
+      for (int i = 0; i < scalar_size; ++i)
+      {
+         velocity[i + c*scalar_size] = value;
+      }
+   }
+   Vector element_rate;
+   rate.Mult(velocity, element_rate);
+   const real_t expected = dim == 2 ? sqrt(8.0) : sqrt(12.0);
+   for (int e = 0; e < mesh.GetNE(); ++e)
+   {
+      REQUIRE(element_rate[e] == MFEM_Approx(expected, 1e-13, 1e-13));
+   }
+   REQUIRE(rate.ComputeMax(velocity) == MFEM_Approx(expected, 1e-13, 1e-13));
+}
+
 #ifdef MFEM_USE_MPI
 TEST_CASE("Vector DG Mass Inverse permits empty MPI ranks",
           "[Parallel][DGMassInverseVectorEmpty]")

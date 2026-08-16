@@ -998,6 +998,124 @@ void ElementMeanMagnitudeOperator::ComputeTau(
    });
 }
 
+FehnALECFLRateOperator::FehnALECFLRateOperator(
+   FiniteElementSpace &fes_, const IntegrationRule &ir_)
+   : Operator(fes_.GetNE(), fes_.GetVSize()), fes(fes_), ir(ir_),
+     dim(fes_.GetMesh()->Dimension()), ne(fes_.GetNE()),
+     nd(fes_.GetTypicalFE()->GetDof()), nq(ir_.GetNPoints()),
+     element_values(dim * ne * nd), quadrature_values(dim * ne * nq),
+     element_rates(ne)
+{
+   MFEM_VERIFY(dim == 2 || dim == 3,
+               "Fehn ALE CFL rate supports 2D and 3D meshes");
+   MFEM_VERIFY(fes.GetMesh()->SpaceDimension() == dim,
+               "Fehn ALE CFL rate requires a full-dimensional mesh");
+   MFEM_VERIFY(fes.GetVDim() == dim,
+               "Fehn ALE CFL rate requires one velocity component per dimension");
+   MFEM_VERIFY(fes.GetOrdering() == Ordering::byNODES,
+               "Fehn ALE CFL rate requires byNODES vector ordering");
+   MFEM_VERIFY(fes.GetVSize() == fes.GetTrueVSize(),
+               "Fehn ALE CFL rate requires a broken vector space");
+   element_restriction = fes.GetElementRestriction(
+                            ElementDofOrdering::LEXICOGRAPHIC);
+   quadrature_interpolator = fes.GetQuadratureInterpolator(ir);
+   MFEM_VERIFY(element_restriction != nullptr &&
+               element_restriction->Height() == dim * ne * nd,
+               "Fehn ALE CFL rate requires a tensor element restriction");
+   MFEM_VERIFY(quadrature_interpolator != nullptr,
+               "Fehn ALE CFL rate requires a quadrature interpolator");
+   quadrature_interpolator->EnableTensorProducts();
+   quadrature_interpolator->SetOutputLayout(QVectorLayout::byNODES);
+   element_values.UseDevice(true);
+   quadrature_values.UseDevice(true);
+   element_rates.UseDevice(true);
+}
+
+void FehnALECFLRateOperator::Mult(const Vector &relative_velocity,
+                                  Vector &element_rate) const
+{
+   MFEM_VERIFY(relative_velocity.Size() == Width(),
+               "Fehn ALE CFL relative velocity has the wrong size");
+   element_rate.SetSize(Height());
+   element_rate.UseDevice(true);
+   if (ne == 0) { return; }
+
+   element_restriction->Mult(relative_velocity, element_values);
+   quadrature_interpolator->Values(element_values, quadrature_values);
+   const GeometricFactors *geom = fes.GetMesh()->GetGeometricFactors(
+                                     ir, GeometricFactors::JACOBIANS);
+   const int NE = ne;
+   const int NQ = nq;
+   const real_t *Q = quadrature_values.Read();
+   real_t *R = element_rate.Write();
+
+   if (dim == 2)
+   {
+      auto U = Reshape(Q, NQ, 2, NE);
+      auto J = Reshape(geom->J.Read(), NQ, 2, 2, NE);
+      mfem::forall(NE, [=] MFEM_HOST_DEVICE(int e)
+      {
+         real_t maximum = 0.0;
+         for (int q = 0; q < NQ; ++q)
+         {
+            const real_t a = J(q,0,0,e);
+            const real_t b = J(q,0,1,e);
+            const real_t c = J(q,1,0,e);
+            const real_t d = J(q,1,1,e);
+            const real_t inverse_det = 1.0 / (a*d - b*c);
+            const real_t u0 = U(q,0,e);
+            const real_t u1 = U(q,1,e);
+            const real_t w0 = (d*u0 - c*u1) * inverse_det;
+            const real_t w1 = (a*u1 - b*u0) * inverse_det;
+            maximum = fmax(maximum, sqrt(w0*w0 + w1*w1));
+         }
+         R[e] = maximum;
+      });
+   }
+   else
+   {
+      auto U = Reshape(Q, NQ, 3, NE);
+      auto J = Reshape(geom->J.Read(), NQ, 3, 3, NE);
+      mfem::forall(NE, [=] MFEM_HOST_DEVICE(int e)
+      {
+         real_t maximum = 0.0;
+         for (int q = 0; q < NQ; ++q)
+         {
+            const real_t a = J(q,0,0,e);
+            const real_t b = J(q,0,1,e);
+            const real_t c = J(q,0,2,e);
+            const real_t d = J(q,1,0,e);
+            const real_t f = J(q,1,2,e);
+            const real_t g = J(q,2,0,e);
+            const real_t h = J(q,2,1,e);
+            const real_t i = J(q,2,2,e);
+            const real_t j11 = J(q,1,1,e);
+            const real_t determinant =
+               a*(j11*i - f*h) - b*(d*i - f*g) + c*(d*h - j11*g);
+            const real_t inverse_det = 1.0 / determinant;
+            const real_t u0 = U(q,0,e);
+            const real_t u1 = U(q,1,e);
+            const real_t u2 = U(q,2,e);
+            const real_t w0 = ((j11*i-f*h)*u0 + (f*g-d*i)*u1 +
+                               (d*h-j11*g)*u2) * inverse_det;
+            const real_t w1 = ((c*h-b*i)*u0 + (a*i-c*g)*u1 +
+                               (b*g-a*h)*u2) * inverse_det;
+            const real_t w2 = ((b*f-c*j11)*u0 + (c*d-a*f)*u1 +
+                               (a*j11-b*d)*u2) * inverse_det;
+            maximum = fmax(maximum, sqrt(w0*w0 + w1*w1 + w2*w2));
+         }
+         R[e] = maximum;
+      });
+   }
+}
+
+real_t FehnALECFLRateOperator::ComputeMax(
+   const Vector &relative_velocity) const
+{
+   Mult(relative_velocity, element_rates);
+   return ne > 0 ? element_rates.Max() : 0.0;
+}
+
 namespace
 {
 
