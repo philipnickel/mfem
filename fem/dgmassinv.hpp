@@ -196,12 +196,14 @@ public:
    void Mult(const Vector &x, Vector &y) const override;
 };
 
-/** @brief Per-element magnitude of the volume mean of an equal-order vector
-    field.
+/** @brief Per-element velocity scales and divergence diagnostic for an
+    equal-order vector field.
 
     The input contains @a dim scalar L-vectors in byNODES ordering. Mult()
-    returns one mean magnitude per local element and refreshes the matching
-    physical element volumes. */
+    preserves the original behavior and returns the magnitude of the vector
+    mean. ComputeMeasures() additionally returns the mean velocity magnitude
+    and the root-mean-square physical divergence. All measures use the same
+    quadrature rule and refresh the matching physical element volumes. */
 class ElementMeanMagnitudeOperator : public Operator
 {
 private:
@@ -210,12 +212,18 @@ private:
    const ElementRestrictionOperator *element_restriction = nullptr; ///< Not owned.
    const QuadratureInterpolator *quadrature_interpolator = nullptr; ///< Not owned.
    int dim, scalar_size, ne, nd, nq;
-   mutable Vector element_values, quadrature_values, volumes;
+   mutable Vector element_values, quadrature_values, quadrature_derivatives;
+   mutable Vector volumes, scratch_mean_magnitude, scratch_divergence_rms;
 
 public:
    ElementMeanMagnitudeOperator(FiniteElementSpace &fes_,
                                 const IntegrationRule &ir_);
    void Mult(const Vector &x, Vector &y) const override;
+   /** Compute the magnitude of the vector mean, the mean vector magnitude,
+       and the RMS physical divergence for every local element. */
+   void ComputeMeasures(const Vector &x, Vector &vector_mean,
+                        Vector &mean_magnitude,
+                        Vector &divergence_rms) const;
    /** Compute @a scale times the most recently evaluated mean magnitude
        times the square root of the physical element volume. */
    void ComputeTau(const Vector &mean, real_t scale, Vector &tau) const;

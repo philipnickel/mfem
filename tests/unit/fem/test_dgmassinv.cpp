@@ -244,6 +244,65 @@ TEST_CASE("Fehn ALE CFL rate is quadrature-point local",
    REQUIRE(rate.ComputeMax(velocity) == MFEM_Approx(expected, 1e-13, 1e-13));
 }
 
+TEST_CASE("Element velocity measures retain cancellation and divergence",
+          "[GPU][ElementMeanMagnitude]")
+{
+   const int dim = GENERATE(2, 3);
+   constexpr int order = 2;
+   Mesh mesh = dim == 2 ?
+               Mesh::MakeCartesian2D(
+                  1, 1, Element::QUADRILATERAL, true, 1.0, 1.0) :
+               Mesh::MakeCartesian3D(
+                  1, 1, 1, Element::HEXAHEDRON, 1.0, 1.0, 1.0);
+   L2_FECollection fec(order, dim, BasisType::GaussLobatto);
+   FiniteElementSpace scalar_fes(&mesh, &fec);
+   FiniteElementSpace vector_fes(&mesh, &fec, dim, Ordering::byNODES);
+   GridFunction velocity(&vector_fes);
+   const Geometry::Type geometry = dim == 2 ? Geometry::SQUARE : Geometry::CUBE;
+   const IntegrationRule &ir = IntRules.Get(geometry, 2*order + 2);
+   ElementMeanMagnitudeOperator measures(scalar_fes, ir);
+   Vector vector_mean, mean_magnitude, divergence_rms;
+
+   VectorFunctionCoefficient constant(dim, [=](const Vector &, Vector &value)
+   {
+      value = 0.0;
+      value(0) = 3.0;
+      value(1) = 4.0;
+      if (dim == 3) { value(2) = 12.0; }
+   });
+   velocity.ProjectCoefficient(constant);
+   measures.ComputeMeasures(velocity, vector_mean, mean_magnitude,
+                            divergence_rms);
+   const real_t expected_constant = dim == 2 ? 5.0 : 13.0;
+   for (int e = 0; e < mesh.GetNE(); ++e)
+   {
+      REQUIRE(vector_mean[e] == MFEM_Approx(expected_constant, 1e-13, 1e-13));
+      REQUIRE(mean_magnitude[e] == MFEM_Approx(expected_constant, 1e-13, 1e-13));
+      REQUIRE(divergence_rms[e] == MFEM_Approx(0.0, 1e-13, 1e-13));
+   }
+
+   VectorFunctionCoefficient centered(dim, [=](const Vector &x, Vector &value)
+   {
+      for (int c = 0; c < dim; ++c) { value(c) = x(c) - 0.5; }
+   });
+   velocity.ProjectCoefficient(centered);
+   measures.ComputeMeasures(velocity, vector_mean, mean_magnitude,
+                            divergence_rms);
+   for (int e = 0; e < mesh.GetNE(); ++e)
+   {
+      REQUIRE(vector_mean[e] == MFEM_Approx(0.0, 1e-13, 1e-13));
+      REQUIRE(mean_magnitude[e] + 1e-14 >= vector_mean[e]);
+      REQUIRE(mean_magnitude[e] > 0.0);
+      REQUIRE(divergence_rms[e] == MFEM_Approx(real_t(dim), 1e-12, 1e-12));
+   }
+
+   // Mult remains the original magnitude-of-vector-mean interface.
+   Vector compatible;
+   measures.Mult(velocity, compatible);
+   compatible -= vector_mean;
+   REQUIRE(compatible.Normlinf() == MFEM_Approx(0.0, 1e-14, 1e-14));
+}
+
 #ifdef MFEM_USE_MPI
 TEST_CASE("Vector DG Mass Inverse permits empty MPI ranks",
           "[Parallel][DGMassInverseVectorEmpty]")

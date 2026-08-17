@@ -905,7 +905,8 @@ ElementMeanMagnitudeOperator::ElementMeanMagnitudeOperator(
      scalar_size(fes_.GetVSize()), ne(fes_.GetNE()),
      nd(fes_.GetTypicalFE()->GetDof()), nq(ir_.GetNPoints()),
      element_values(2 * ne * nd), quadrature_values(dim * ne * nq),
-     volumes(ne)
+     quadrature_derivatives(dim * dim * ne * nq), volumes(ne),
+     scratch_mean_magnitude(ne), scratch_divergence_rms(ne)
 {
    MFEM_VERIFY(dim == 2 || dim == 3,
                "element mean magnitude supports 2D and 3D meshes");
@@ -925,20 +926,36 @@ ElementMeanMagnitudeOperator::ElementMeanMagnitudeOperator(
    quadrature_interpolator->SetOutputLayout(QVectorLayout::byNODES);
    element_values.UseDevice(true);
    quadrature_values.UseDevice(true);
+   quadrature_derivatives.UseDevice(true);
    volumes.UseDevice(true);
+   scratch_mean_magnitude.UseDevice(true);
+   scratch_divergence_rms.UseDevice(true);
 }
 
 void ElementMeanMagnitudeOperator::Mult(const Vector &x, Vector &y) const
 {
+   ComputeMeasures(x, y, scratch_mean_magnitude, scratch_divergence_rms);
+}
+
+void ElementMeanMagnitudeOperator::ComputeMeasures(
+   const Vector &x, Vector &vector_mean, Vector &mean_magnitude,
+   Vector &divergence_rms) const
+{
    MFEM_VERIFY(x.Size() == Width(), "element mean input has the wrong size");
-   y.SetSize(Height());
-   y.UseDevice(true);
+   vector_mean.SetSize(Height());
+   mean_magnitude.SetSize(Height());
+   divergence_rms.SetSize(Height());
+   vector_mean.UseDevice(true);
+   mean_magnitude.UseDevice(true);
+   divergence_rms.UseDevice(true);
    for (int c = 0; c < dim; ++c)
    {
-      Vector component, restricted_component, q_component;
+      Vector component, restricted_component, q_component, q_derivatives;
       component.MakeRef(element_values, 0, ne * nd);
       restricted_component.MakeRef(element_values, ne * nd, ne * nd);
       q_component.MakeRef(quadrature_values, c * ne * nq, ne * nq);
+      q_derivatives.MakeRef(quadrature_derivatives,
+                            c * dim * ne * nq, dim * ne * nq);
       const real_t *X = x.Read();
       real_t *C = component.Write();
       const int offset = c * scalar_size;
@@ -948,6 +965,8 @@ void ElementMeanMagnitudeOperator::Mult(const Vector &x, Vector &y) const
       });
       element_restriction->Mult(component, restricted_component);
       quadrature_interpolator->Values(restricted_component, q_component);
+      quadrature_interpolator->PhysDerivatives(restricted_component,
+                                               q_derivatives);
    }
 
    const GeometricFactors *geom = fes.GetMesh()->GetGeometricFactors(
@@ -955,21 +974,35 @@ void ElementMeanMagnitudeOperator::Mult(const Vector &x, Vector &y) const
    const real_t *W = ir.GetWeights().Read();
    const real_t *J = geom->detJ.Read();
    const real_t *Q = quadrature_values.Read();
+   const real_t *D = quadrature_derivatives.Read();
    real_t *V = volumes.Write();
-   real_t *Y = y.Write();
+   real_t *VM = vector_mean.Write();
+   real_t *MM = mean_magnitude.Write();
+   real_t *DR = divergence_rms.Write();
    const int nqe = nq * ne;
    mfem::forall(ne, [=] MFEM_HOST_DEVICE(int e)
    {
       real_t integral[3] = {0.0, 0.0, 0.0};
+      real_t magnitude_integral = 0.0;
+      real_t divergence_squared_integral = 0.0;
       real_t volume = 0.0;
       for (int q = 0; q < nq; ++q)
       {
          const real_t weight = W[q] * fabs(J[q + nq * e]);
          volume += weight;
+         real_t magnitude2 = 0.0;
+         real_t divergence = 0.0;
          for (int c = 0; c < dim; ++c)
          {
-            integral[c] += weight * Q[q + nq * e + c * nqe];
+            const real_t value = Q[q + nq * e + c * nqe];
+            integral[c] += weight * value;
+            magnitude2 += value * value;
+            // Each component owns a scalar derivative block laid out as
+            // (quadrature point, physical derivative, element).
+            divergence += D[q + nq * (c + dim * e) + c * dim * nqe];
          }
+         magnitude_integral += weight * sqrt(magnitude2);
+         divergence_squared_integral += weight * divergence * divergence;
       }
       V[e] = volume;
       real_t magnitude2 = 0.0;
@@ -978,7 +1011,9 @@ void ElementMeanMagnitudeOperator::Mult(const Vector &x, Vector &y) const
          const real_t mean = integral[c] / volume;
          magnitude2 += mean * mean;
       }
-      Y[e] = sqrt(magnitude2);
+      VM[e] = sqrt(magnitude2);
+      MM[e] = magnitude_integral / volume;
+      DR[e] = sqrt(divergence_squared_integral / volume);
    });
 }
 
